@@ -1,0 +1,28 @@
+# iCloud Sync Configuration
+
+# iCloud Credentials (It is recommended to use the CLI to set these interactively)
+username: ""
+
+# Sync Settings
+sync_root: "~/iCloud" # Where the virtual files will be mounted
+cache_dir: "~/.cache/icloud_sync"
+
+# File Size Limit for Auto-Download (in MB)
+# Files larger than this will be represented as placeholders until opened
+auto_download_limit_mb: 50
+
+# Local Folder Mappings
+# Map virtual iCloud folders to real local directories for 2-way sync
+# Format: "VirtualName": "/Local/Path"
+# mapped_folders:
+#   "Downloads": "~/Downloads"
+
+# Directories to Sync explicitly (relative to iCloud Drive root)
+# Leave empty to sync everything
+include_folders:
+  - "Documents"
+  - "Pictures"
+
+exclude_patterns:
+  - "*.tmp"
+  - ".DS_Store"

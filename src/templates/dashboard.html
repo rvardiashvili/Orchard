@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UnixSync Dashboard</title>
+    <style>
+        :root {
+            --bg: #1e1e1e;
+            --card-bg: #2d2d2d;
+            --text: #ffffff;
+            --accent: #007aff; /* Apple Blue */
+            --success: #34c759;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        h1 { margin-bottom: 20px; border-bottom: 1px solid #444; padding-bottom: 10px; }
+        h2 { font-size: 1.2rem; margin-top: 0; }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: var(--success);
+            margin-right: 8px;
+        }
+        
+        .device-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #444;
+            padding: 10px 0;
+        }
+        .device-item:last-child { border-bottom: none; }
+        .battery { font-weight: bold; color: var(--success); }
+        .btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+        .btn:hover { opacity: 0.9; }
+        
+        pre {
+            background: #111;
+            padding: 10px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>UnixSync Control Center</h1>
+        
+        <div class="grid">
+            <!-- System Status -->
+            <div class="card">
+                <h2><span class="status-indicator"></span>System Status</h2>
+                <p><strong>Service:</strong> Running</p>
+                <p><strong>User:</strong> <span id="username">Loading...</span></p>
+                <p><strong>Mount Point:</strong> <span id="mount-point">Loading...</span></p>
+            </div>
+
+            <!-- Apple Devices -->
+            <div class="card">
+                <h2>My Devices</h2>
+                <div id="device-list">
+                    <p>Scanning iCloud...</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <!-- Handoff History -->
+            <div class="card">
+                <h2>Recent Handoffs</h2>
+                <ul id="handoff-list" style="padding-left: 20px;">
+                    <li>No recent items.</li>
+                </ul>
+            </div>
+            
+             <!-- Quick Actions -->
+             <div class="card">
+                <h2>Quick Actions</h2>
+                <button class="btn" onclick="testHandoff()">Test Handoff</button>
+                <div style="margin-top: 10px;"></div>
+                <button class="btn" onclick="sendCommand('backup')" style="background-color: #ff9500;">Run Backup</button>
+                <button class="btn" onclick="sendCommand('lock')" style="background-color: #ff3b30;">Lock Screen</button>
+            </div>
+            
+            <!-- Local Brain -->
+            <div class="card">
+                <h2>Second Brain</h2>
+                <div style="display: flex; gap: 10px;">
+                    <input type="text" id="search-query" placeholder="Search your files..." style="flex:1; padding: 5px; border-radius: 4px; border: none;">
+                    <button class="btn" onclick="searchDocs()">Search</button>
+                </div>
+                <div style="margin-top: 10px;">
+                    <small style="color: #888;">Only downloaded files are searchable.</small>
+                    <button class="btn" onclick="syncAllDocs()" style="font-size: 0.8rem; background: #333; float: right;">Download All Cloud Files</button>
+                </div>
+                <ul id="search-results" style="margin-top: 30px; padding-left: 20px;"></ul>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function syncAllDocs() {
+            if(!confirm("Download EVERYTHING from iCloud? This might take a while.")) return;
+            const res = await fetch('/api/v1/sync_all', {method: 'POST'});
+            const data = await res.json();
+            alert(data.message);
+        }
+
+        async function searchDocs() {
+            if(!confirm("Run command: " + cmd + "?")) return;
+            try {
+                const response = await fetch('/api/v1/command', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({cmd: cmd})
+                });
+                const res = await response.json();
+                alert(res.message || res.error);
+            } catch(e) {
+                alert("Error: " + e);
+            }
+        }
+
+        async function loadStatus() {
+            try {
+                const response = await fetch('/api/v1/status');
+                const data = await response.json();
+                
+                document.getElementById('username').innerText = data.user || 'Guest';
+                document.getElementById('mount-point').innerText = data.sync_root || 'Not mounted';
+                
+                // Devices
+                const devList = document.getElementById('device-list');
+                if (data.devices && data.devices.length > 0) {
+                    devList.innerHTML = '';
+                    data.devices.forEach(dev => {
+                        const div = document.createElement('div');
+                        div.className = 'device-item';
+                        div.innerHTML = `
+                            <div>
+                                <strong>${dev.name}</strong><br>
+                                <small>${dev.model}</small>
+                            </div>
+                            <div style="text-align: right">
+                                <span class="battery">${dev.battery}%</span>
+                                <br>
+                                <button class="btn" style="margin-top:5px" onclick="pingDevice('${dev.id}')">Ping</button>
+                            </div>
+                        `;
+                        devList.appendChild(div);
+                    });
+                } else {
+                    devList.innerHTML = '<p>No devices found or API not ready.</p>';
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function pingDevice(id) {
+            if(!confirm("Play sound on this device?")) return;
+            await fetch('/api/v1/ping', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: id})
+            });
+            alert("Signal sent.");
+        }
+
+        async function testHandoff() {
+            await fetch('/api/v1/open', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({url: 'https://google.com'})
+            });
+        }
+
+        // Load immediately then every 30s
+        loadStatus();
+        setInterval(loadStatus, 30000);
+    </script>
+</body>
+</html>

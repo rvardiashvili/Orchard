@@ -1,0 +1,11 @@
+pyicloud
+fusepy
+watchdog
+keyring
+keyrings.alt
+caldav
+pyyaml
+requests
+tzlocal
+flask
+gevent
