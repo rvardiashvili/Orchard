@@ -5,7 +5,7 @@
 
 set -e
 
-echo "=== UnixSync: iCloud for Manjaro ==="
+echo "=== Orchard: Apple Ecosystem for Linux ==="
 
 # Check for Python
 if ! command -v python3 &> /dev/null; then

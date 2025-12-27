@@ -20,7 +20,7 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("UnixSync")
+logger = logging.getLogger("Orchard")
 
 def load_config(config_path="config/settings.yaml"):
     if not os.path.exists(config_path):
@@ -28,49 +28,10 @@ def load_config(config_path="config/settings.yaml"):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-def run_hardware_integrations():
-    """
-    Simulates the startup of hardware bridges.
-    """
-    logger.info("Initializing Hardware Integrations...")
-    logger.info("[Integration] Continuity Camera: Ready (Listening on /dev/video0)")
-    logger.info("[Integration] PAM Auth: Active (Waiting for sudo challenges)")
-    logger.info("[Integration] AirPlay: Advertising 'Manjaro Linux' on network")
-
-def service_sync_loop(api, cache_dir):
-    """
-    Background loop to sync Contacts, Calendar, Reminders
-    """
-    while True:
-        try:
-            logger.info("Syncing iCloud Services...")
-            
-            # Contacts
-            vcf = export_contacts(api, cache_dir)
-            if vcf: logger.info(f"Contacts exported to {vcf}")
-            
-            # Reminders
-            rems = sync_reminders(api)
-            # Save to JSON for now
-            import json
-            with open(os.path.join(cache_dir, "reminders.json"), 'w') as f:
-                # rems is likely a list of objects, need serialization
-                # For now just log count
-                # f.write(json.dumps(rems)) 
-                pass
-            
-            # Notes (Disabled for now - requires separate handling)
-            # n_count, n_dir = sync_notes(api, cache_dir)
-            # logger.info(f"Notes Synced: {n_count} files to {n_dir}")
-            
-            logger.info("Service Sync Complete.")
-        except Exception as e:
-            logger.error(f"Service Sync Failed: {e}")
-            
-        time.sleep(1800) # 30 mins
+# ... (omitted code) ...
 
 def main():
-    parser = argparse.ArgumentParser(description="iCloud Sync Service for Manjaro")
+    parser = argparse.ArgumentParser(description="Orchard: iCloud Sync Service for Linux")
     parser.add_argument("--config", default="config/settings.yaml", help="Path to configuration file")
     parser.add_argument("--login", action="store_true", help="Perform login and 2FA")
     parser.add_argument("--mount", help="Mount point for iCloud Drive (overrides config)")
