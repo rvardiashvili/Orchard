@@ -17,6 +17,19 @@ class RealCloudFS(Operations):
     """
     A FUSE filesystem that connects to Real iCloud Drive.
     """
+    
+    PROTECTED_FILES = {
+        'dir_structure.json', 
+        '.clipboard',
+        'LinuxSync',
+        'cloud_map.json',
+        'contacts.vcf',
+        'reminders.json',
+        'Reminders.md',
+        'Calendar.md',
+        'Calendar.ics',
+        'Notes'
+    }
 
     def __init__(self, api, root_cache_dir, local_mappings=None):
         self.api = api
@@ -412,21 +425,9 @@ class RealCloudFS(Operations):
                 if os.path.isdir(local_cache_path):
                     local_files = os.listdir(local_cache_path)
                     
-                    # Protected system files that exist locally but not remotely
-                    protected_files = {
-                        'dir_structure.json', 
-                        '.clipboard',
-                        'LinuxSync',
-                        'cloud_map.json',
-                        'contacts.vcf',
-                        'reminders.json',
-                        'Reminders.md',
-                        'Notes'
-                    }
-
                     for f in local_files:
                         # 1. Skip protected internal files
-                        if f in protected_files or f.startswith('.'):
+                        if f in self.PROTECTED_FILES or f.startswith('.'):
                             continue
                             
                         full_v_path = os.path.join(path, f)
@@ -925,6 +926,11 @@ class RealCloudFS(Operations):
                 # Create list to avoid modification during iteration
                 to_check = list(self.last_access.keys())
                 for path in to_check:
+                    # Check if protected (root level files mostly)
+                    name = os.path.basename(path)
+                    if name in self.PROTECTED_FILES:
+                        continue
+
                     last_seen = self.last_access[path]
                     # If file is old enough AND not currently pending upload
                     if (now - last_seen > self.CACHE_RETENTION_TIME) and (path not in self.pending_uploads):

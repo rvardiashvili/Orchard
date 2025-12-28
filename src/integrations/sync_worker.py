@@ -5,9 +5,14 @@ import time
 
 logger = logging.getLogger(__name__)
 
+from src.integrations.apple_reminders import AppleReminders
+from src.integrations.apple_notes import AppleNotes
+from src.integrations.apple_contacts import AppleContacts
+from src.integrations.apple_calendar import AppleCalendar
+
 def sync_all_services(api, cache_dir):
     """
-    Main entry point to sync auxiliary services (Contacts, Reminders, Notes).
+    Main entry point to sync auxiliary services (Contacts, Reminders, Notes, Calendar).
     """
     logger.info("Starting Service Sync...")
     
@@ -26,51 +31,58 @@ def sync_all_services(api, cache_dir):
     except Exception as e:
         logger.error(f"Notes sync failed: {e}")
 
+    try:
+        sync_calendar(api, cache_dir)
+    except Exception as e:
+        logger.error(f"Calendar sync failed: {e}")
+
     logger.info("Service Sync Cycle Complete.")
 
 def sync_contacts(api, cache_dir):
-    if not hasattr(api, 'contacts'):
-        return
-
-    logger.info("Exporting Contacts...")
+    logger.info("Syncing Contacts...")
     try:
-        contacts = api.contacts.all
+        svc = AppleContacts(api)
+        contacts = svc.fetch_all()
         vcf_path = os.path.join(cache_dir, "contacts.vcf")
         
         with open(vcf_path, 'w', encoding='utf-8') as f:
             for c in contacts:
-                # Basic VCF 3.0 construction
-                first = c.get('firstName', '')
-                last = c.get('lastName', '')
-                full_name = f"{first} {last}".strip()
-                if not full_name:
-                    # Try company name
-                    full_name = c.get('companyName', 'Unknown')
-                    
-                f.write("BEGIN:VCARD\nVERSION:3.0\n")
-                f.write(f"FN:{full_name}\n")
-                f.write(f"N:{last};{first};;;\n")
-                
-                # Phones
-                for p in c.get('phones', []):
-                    label = p.get('label', 'CELL').upper()
-                    number = p.get('field', '')
-                    f.write(f"TEL;TYPE={label}:{number}\n")
-                
-                # Emails
-                for e in c.get('emailAddresses', []):
-                    label = e.get('label', 'HOME').upper()
-                    email = e.get('field', '')
-                    f.write(f"EMAIL;TYPE={label}:{email}\n")
-                    
-                f.write("END:VCARD\n")
+                try:
+                    vcard_str = svc.export_vcard(c)
+                    f.write(vcard_str)
+                    f.write("\n")
+                except Exception as e:
+                    logger.warning(f"Failed to export contact: {e}")
         
         logger.info(f"Contacts saved to {vcf_path}")
     except Exception as e:
         logger.error(f"Error fetching contacts: {e}")
 
-from src.integrations.apple_reminders import AppleReminders
-from src.integrations.apple_notes import AppleNotes
+def sync_calendar(api, cache_dir):
+    logger.info("Syncing Calendar...")
+    try:
+        svc = AppleCalendar(api)
+        events = svc.fetch_events(days_back=30, days_forward=90)
+        
+        # 1. ICS Export
+        ics_path = os.path.join(cache_dir, "Calendar.ics")
+        ics_data = svc.export_ics(events)
+        with open(ics_path, 'wb') as f: # ICS data is bytes (utf-8 encoded) or string? icalendar to_ical returns bytes
+             # export_ics in my implementation returned decode('utf-8'), so it's string.
+             # Wait, let's check AppleCalendar.export_ics return type.
+             # It returns cal.to_ical().decode('utf-8'). So it is string.
+             f.write(ics_data.encode('utf-8'))
+        
+        # 2. Markdown Export
+        md_path = os.path.join(cache_dir, "Calendar.md")
+        md_data = svc.export_markdown(events)
+        with open(md_path, 'w', encoding='utf-8') as f:
+            f.write(md_data)
+            f.write("\n\n*Synced via Orchard*")
+            
+        logger.info(f"Calendar saved to {ics_path}")
+    except Exception as e:
+        logger.error(f"Error fetching calendar: {e}")
 
 def sync_reminders(api, cache_dir):
     # Use our custom CloudKit implementation

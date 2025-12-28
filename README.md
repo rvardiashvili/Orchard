@@ -5,9 +5,11 @@
 ## Features
 
 *   **iCloud Drive FUSE Mount:** Access your iCloud files as if they were local. Reads and writes are cached and synced in the background.
-*   **Notes & Reminders Sync:** 
+*   **Service Sync:**
     *   **Reminders:** View your lists as Markdown files (`[ ] Task`).
     *   **Notes:** Access your notes as plain text files. (Powered by custom CloudKit reverse-engineering).
+    *   **Calendar:** View events as Markdown summaries and standard `.ics` exports.
+    *   **Contacts:** Auto-export contacts to standard `.vcf` format (with photos).
 *   **Smart Caching:** Files are cached locally for performance and offline access, with graceful eviction to save disk space.
 *   **System Integration:**
     *   **Handoff:** Open URLs from your iPhone directly in your Linux browser.
