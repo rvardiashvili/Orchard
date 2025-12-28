@@ -26,6 +26,11 @@ To seamlessly integrate with Linux desktop applications:
     *   Download or link to `http://localhost:8080/api/v1/contacts.vcf`.
     *   (Most Linux Contact apps do not support live subscription to a VCF file yet, but you can script a periodic import).
 
+*   **Desktop Integration (Automatic Import):** Provides endpoints for CalDAV/CardDAV subscription.
+*   **Web UI (Orchard Apps):** A local web interface (`http://localhost:8080/apps`) for interactive management of:
+    *   **Reminders:** View and toggle completion status directly.
+    *   **Notes:** View notes content.
+
 ## Installation
 
 1.  **Clone the repository:**

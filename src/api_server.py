@@ -3,7 +3,9 @@ import logging
 from flask import Flask, request, jsonify, render_template, send_from_directory
 import threading
 from src.device_status import get_devices, play_sound
-import src.metadata_crawler # Import the module to access the global crawler instance
+from src.metadata_crawler import MetadataCrawler # Import the module to access the global crawler instance
+from src.integrations.apple_reminders import AppleReminders # Import AppleReminders
+from src.integrations.apple_notes import AppleNotes # Import AppleNotes
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +200,125 @@ def open_url():
         logger.error(f"Handoff error: {e}")
         return jsonify({"error": str(e)}), 500
 
-CACHE_DIR = os.path.expanduser("~/.cache/icloud_sync")
+@app.route('/api/v1/reminders/task/<record_id>/toggle_completed', methods=['POST'])
+def toggle_reminder_completed(record_id):
+    """
+    Toggle completion status of a reminder.
+    """
+    if not API_CLIENT or not REMINDERS_SVC:
+        return jsonify({"error": "Service not initialized"}), 503
+
+    try:
+        # Ensure latest data
+        REMINDERS_SVC.refresh_if_needed()
+        
+        # Find the task
+        task = None
+        for r_list in REMINDERS_SVC._cache.values():
+            for t in r_list:
+                if t['id'] == record_id:
+                    task = t
+                    break
+            if task: break
+
+        if not task:
+            return jsonify({"error": f"Reminder with ID {record_id} not found"}), 404
+
+        # Toggle status
+        new_status = not task['completed']
+        
+        # Call update
+        success = REMINDERS_SVC.update_task(record_id, task['etag'], {"Completed": new_status})
+        
+        if success:
+            # Update local cache immediately
+            task['completed'] = new_status
+            return jsonify({"status": "success", "new_completed": new_status})
+        else:
+            return jsonify({"error": "Failed to update reminder in iCloud"}), 500
+
+    except Exception as e:
+        logger.error(f"Error toggling reminder: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/v1/reminders', methods=['GET'])
+def get_reminders():
+    """
+    Get all reminders data as JSON.
+    """
+    if not API_CLIENT or not REMINDERS_SVC:
+        return jsonify({"error": "Service not initialized"}), 503
+
+    try:
+        REMINDERS_SVC.refresh_if_needed()
+        all_reminders = []
+        for list_name, tasks in REMINDERS_SVC._cache.items():
+            for task in tasks:
+                task['listName'] = list_name # Add list name for context
+                all_reminders.append(task)
+        
+        return jsonify(all_reminders)
+    except Exception as e:
+        logger.error(f"Error fetching reminders for UI: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/v1/notes', methods=['GET'])
+def get_notes():
+    """
+    Get all notes data as JSON.
+    """
+    if not API_CLIENT or not NOTES_SVC: # Need to initialize NOTES_SVC
+        return jsonify({"error": "Service not initialized"}), 503
+    
+    try:
+        NOTES_SVC.refresh_if_needed()
+        notes_data = NOTES_SVC.list_notes()
+        return jsonify(notes_data)
+    except Exception as e:
+        logger.error(f"Error fetching notes for UI: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/apps')
+def apps_dashboard():
+    return render_template('apps.html')
+
+@app.route('/apps/reminders')
+def app_reminders():
+    return render_template('reminders.html')
+
+@app.route('/apps/notes')
+def app_notes():
+    return render_template('notes.html')
+
+# --- PWA Manifests ---
+@app.route('/api/v1/manifest/reminders.json')
+def manifest_reminders():
+    return jsonify({
+        "name": "Reminders",
+        "short_name": "Reminders",
+        "start_url": "/apps/reminders",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#007aff",
+        "icons": [] # Add icons later
+    })
+
+@app.route('/api/v1/manifest/notes.json')
+def manifest_notes():
+    return jsonify({
+        "name": "Notes",
+        "short_name": "Notes",
+        "start_url": "/apps/notes",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#dca326",
+        "icons": []
+    })
+
+API_CLIENT = None
+CACHE_DIR = os.path.expanduser("~/.cache/icloud_sync") # Default
+REMINDERS_SVC = None # Global for AppleReminders instance
+NOTES_SVC = None # Global for AppleNotes instance
 
 @app.route('/api/v1/calendar.ics', methods=['GET'])
 def get_calendar_ics():
@@ -221,19 +341,20 @@ def get_contacts_vcf():
     except Exception as e:
         return jsonify({"error": "Contacts not found or not synced yet."}), 404
 
-def start_server(sync_root_path, api_client, port=8080, cache_dir=None):
-    global SYNC_ROOT, API_CLIENT, CACHE_DIR
+def start_server(sync_root_path, api_client, port=8080, cache_dir=None, reminders_svc=None, notes_svc=None):
+    global SYNC_ROOT, API_CLIENT, CACHE_DIR, REMINDERS_SVC, NOTES_SVC
     SYNC_ROOT = sync_root_path
     API_CLIENT = api_client
     if cache_dir:
         CACHE_DIR = cache_dir
     
-    def run():
-        logger.info(f"Starting Local API Bridge on port {port}")
-        # Disable Flask banner
-        cli = logging.getLogger('werkzeug')
-        cli.setLevel(logging.ERROR)
-        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    REMINDERS_SVC = reminders_svc # Assign pre-initialized instance
+    NOTES_SVC = notes_svc # Assign pre-initialized instance
+    logger.info(f"Starting Local API Bridge on port {port}")
+    # Disable Flask banner
+    cli = logging.getLogger('werkzeug')
+    cli.setLevel(logging.ERROR)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
     t = threading.Thread(target=run, daemon=True)
     t.start()

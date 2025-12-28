@@ -23,8 +23,8 @@ This document outlines the requirements, architecture, and features for a Linux-
 ### Service Synchronization
 - [ ] **Calendar:** Sync via standard CalDAV protocol. (Requires App-Specific Password strategy).
 - [x] **Reminders:** 
-    - **Implemented (Read-Only):** Reverse-engineered CloudKit API to fetch lists and tasks.
-    - **Format:** Exposed as Markdown files (`/Reminders/MyList.md`).
+    - **Implemented (Read/Write - via Web UI):** Reverse-engineered CloudKit API to fetch lists and tasks. Toggling completion status works via the Web UI.
+    - **Format:** Exposed as Markdown files (`/Reminders/MyList.md`) (Read-Only via FUSE).
 - [ ] **Contacts:** Sync via CardDAV protocol. (Prototype only).
 - [x] **Notes:** 
     - **Implemented (Read-Only):** Reverse-engineered CloudKit/Protobuf format.

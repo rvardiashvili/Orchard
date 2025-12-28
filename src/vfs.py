@@ -240,7 +240,7 @@ class RealCloudFS(Operations):
 
         if path.startswith('/Notes/'):
             filename = path[len('/Notes/'):]
-            if filename.endswith('.txt'):
+            if filename.endswith('.md'):
                 # Reverse lookup title from filename? 
                 # Or refresh and find match.
                 # Filename is sanitized title.
@@ -257,12 +257,27 @@ class RealCloudFS(Operations):
                         safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_')]).strip()
                         if not safe_title: safe_title = f"Note_{note['id']}"
                         
-                        if f"{safe_title}.txt" == filename:
+                        if f"{safe_title}.md" == filename:
                             target_note = note
                             break
                     
                     if target_note:
-                        text = f"Title: {target_note['title']}\n\n{target_note['body']}"
+                        # Create YAML Front Matter
+                        import datetime
+                        created_ts = target_note.get('created')
+                        modified_ts = target_note.get('modified')
+                        
+                        header = "---\n"
+                        header += f"id: {target_note['id']}\n"
+                        if created_ts:
+                            dt = datetime.datetime.fromtimestamp(created_ts / 1000.0)
+                            header += f"created: {dt}\n"
+                        if modified_ts:
+                            dt = datetime.datetime.fromtimestamp(modified_ts / 1000.0)
+                            header += f"modified: {dt}\n"
+                        header += "---\n\n"
+                        
+                        text = f"{header}# {target_note['title']}\n\n{target_note['body']}"
                         content = text.encode('utf-8')
                         self.virtual_file_cache[path] = {'content': content, 'timestamp': now}
                     else:
@@ -508,7 +523,7 @@ class RealCloudFS(Operations):
                 title = note.get('title', 'Untitled')
                 safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_')]).strip()
                 if not safe_title: safe_title = f"Note_{note['id']}"
-                entries.add(f"{safe_title}.txt")
+                entries.add(f"{safe_title}.md")
             
             for name in entries:
                 yield (name, None, 0)

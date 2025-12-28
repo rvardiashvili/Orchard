@@ -133,6 +133,7 @@ def sync_notes(api, cache_dir):
         notes = notes_svc.list_notes()
         
         count = 0
+        import datetime
         for note in notes:
             title = note.get('title', 'Untitled')
             body = note.get('body', '')
@@ -141,12 +142,25 @@ def sync_notes(api, cache_dir):
             safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_')]).strip()
             if not safe_title: safe_title = f"Note_{note['id']}"
             
-            note_path = os.path.join(notes_root, f"{safe_title}.txt")
+            note_path = os.path.join(notes_root, f"{safe_title}.md")
+            
+            # Construct Content with Front Matter
+            created_ts = note.get('created')
+            modified_ts = note.get('modified')
+            
+            header = "---\n"
+            header += f"id: {note['id']}\n"
+            if created_ts:
+                dt = datetime.datetime.fromtimestamp(created_ts / 1000.0)
+                header += f"created: {dt}\n"
+            if modified_ts:
+                dt = datetime.datetime.fromtimestamp(modified_ts / 1000.0)
+                header += f"modified: {dt}\n"
+            header += "---\n\n"
             
             with open(note_path, 'w', encoding='utf-8') as f:
-                f.write(f"Title: {title}\n")
-                f.write(f"Date: {note.get('created')}\n")
-                f.write("-" * 20 + "\n\n")
+                f.write(header)
+                f.write(f"# {title}\n\n")
                 f.write(body)
             count += 1
             

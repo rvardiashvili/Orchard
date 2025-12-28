@@ -208,6 +208,8 @@ class AppleReminders:
                 list_ref = fields.get('List', {}).get('value', {}).get('recordName')
                 
                 reminders.append({
+                    'id': r.get('recordName'),
+                    'etag': r.get('recordChangeTag'),
                     'title': text,
                     'list_id': list_ref,
                     'completed': (fields.get('Completed', {}).get('value', 0) == 1),
@@ -231,3 +233,78 @@ class AppleReminders:
                 result['Orphans'].append(rem)
                 
         return result
+
+    def update_task(self, record_name, etag, fields_to_update):
+        """
+        Update a reminder.
+        :param fields_to_update: dict of {Field: value} (e.g. {'Completed': 1})
+        """
+        if 'ckdatabasews' not in self.api.data['webservices']:
+            return False
+
+        ck_base_url = self.api.data['webservices']['ckdatabasews']['url']
+        container = "com.apple.reminders"
+        params = {
+            'ckjs': '2.0',
+            'clientBuildNumber': self.api.params['clientBuildNumber'],
+            'dsid': self.api.params['dsid'],
+        }
+        
+        # We need the zone ID. Assuming it's cached or we fetch it.
+        # For simplicity, hardcode the known one or re-fetch (expensive).
+        # Better: store zone info in self._cache_metadata
+        # For now, let's just re-fetch purely the zone ID (lightweight).
+        # Actually, let's cache it in __init__?
+        # Let's just do the zone fetch here for safety.
+        
+        zones_url = f"{ck_base_url}/database/1/{container}/production/private/zones/list"
+        zone_id = None
+        try:
+            res = self.api.session.post(zones_url, params=params, json={})
+            if res.status_code == 200:
+                for z in res.json().get('zones', []):
+                    if z['zoneID']['zoneName'] == 'Reminders':
+                        zone_id = z['zoneID']
+                        break
+        except: pass
+        
+        if not zone_id: return False
+
+        modify_url = f"{ck_base_url}/database/1/{container}/production/private/records/modify"
+        
+        # Construct Fields
+        formatted_fields = {}
+        for k, v in fields_to_update.items():
+            formatted_fields[k] = {"value": v}
+
+        operation = {
+            "operationType": "update",
+            "record": {
+                "recordType": "Reminder",
+                "recordName": record_name,
+                "recordChangeTag": etag,
+                "fields": formatted_fields
+            }
+        }
+        
+        payload = {
+            "operations": [operation],
+            "zoneID": zone_id,
+            "atomic": True
+        }
+        
+        try:
+            res = requests.post(
+                modify_url, params=params, json=payload,
+                headers=self.api.session.headers, cookies=self.api.session.cookies
+            )
+            if res.status_code == 200:
+                logger.info(f"Updated reminder {record_name}")
+                return True
+            else:
+                logger.error(f"Update failed: {res.status_code} {res.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Update exception: {e}")
+            return False
+

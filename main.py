@@ -8,6 +8,8 @@ from src.tray import start_tray # Import Tray
 from src.metadata_crawler import MetadataCrawler, crawler # Import Crawler
 from src.watchers import start_watcher
 from src.integrations.sync_worker import sync_all_services
+from src.integrations.apple_reminders import AppleReminders # Import AppleReminders
+from src.integrations.apple_notes import AppleNotes # Import AppleNotes
 import argparse
 import os
 import sys
@@ -95,7 +97,9 @@ def main():
     watcher = start_watcher(cache_dir)
 
     # Start API with the Real API Client (or None if offline)
-    start_server(sync_root, api, port=8080, cache_dir=cache_dir)
+    reminders_svc = AppleReminders(api)
+    notes_svc = AppleNotes(api)
+    start_server(sync_root, api, port=8080, cache_dir=cache_dir, reminders_svc=reminders_svc, notes_svc=notes_svc)
 
     # 3. Start Service Sync Loop
     threading.Thread(target=service_sync_loop, args=(api, cache_dir), daemon=True).start()

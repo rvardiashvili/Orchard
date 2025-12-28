@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notes</title>
+    <link rel="manifest" href="/api/v1/manifest/notes.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+    <style>
+        :root {
+            --sidebar-bg: #f5f5f5;
+            --list-bg: #ffffff;
+            --editor-bg: #ffffff;
+            --text-primary: #000;
+            --text-secondary: #8e8e93;
+            --accent: #dca326; /* Notes Yellow */
+            --border: #e0e0e0;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --sidebar-bg: #1e1e1e;
+                --list-bg: #1c1c1e;
+                --editor-bg: #1c1c1e;
+                --text-primary: #fff;
+                --border: #38383a;
+            }
+        }
+
+        body {
+            height: 100vh;
+            display: flex;
+            overflow: hidden;
+            background-color: var(--sidebar-bg);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+        }
+
+        /* 3-Pane Layout */
+        #folders-pane {
+            width: 200px;
+            background-color: var(--sidebar-bg);
+            border-right: 1px solid var(--border);
+            display: none; /* Hidden for now, simplified to 2-pane */
+        }
+
+        #notes-list-pane {
+            width: 300px;
+            background-color: var(--list-bg);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+        }
+
+        #editor-pane {
+            flex-grow: 1;
+            background-color: var(--editor-bg);
+            display: flex;
+            flex-direction: column;
+            padding: 40px;
+        }
+
+        /* List Styling */
+        .search-bar {
+            padding: 10px;
+            border-bottom: 1px solid var(--border);
+        }
+        .search-bar input {
+            width: 100%;
+            background-color: rgba(128,128,128, 0.1);
+            border: none;
+            border-radius: 8px;
+            padding: 6px 10px;
+            color: var(--text-primary);
+            outline: none;
+        }
+
+        .note-item {
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+        }
+        
+        .note-item.active {
+            background-color: var(--accent);
+            color: white !important;
+        }
+        .note-item.active .note-preview, .note-item.active .note-date {
+            color: rgba(255,255,255, 0.8);
+        }
+
+        .note-title {
+            font-weight: bold;
+            font-size: 16px;
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .note-preview {
+            font-size: 14px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .note-date {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 2px;
+        }
+
+        /* Editor Styling */
+        #note-editor {
+            width: 100%;
+            height: 100%;
+            border: none;
+            outline: none;
+            background: transparent;
+            color: var(--text-primary);
+            font-size: 18px;
+            line-height: 1.5;
+            resize: none;
+        }
+        
+        .toolbar {
+            display: flex;
+            justify-content: flex-end;
+            padding-bottom: 10px;
+        }
+        
+        .toolbar button {
+            background: none;
+            border: none;
+            color: var(--accent);
+            cursor: pointer;
+            margin-left: 15px;
+        }
+
+    </style>
+</head>
+<body>
+
+    <div id="notes-list-pane">
+        <div class="search-bar">
+            <input type="text" placeholder="Search" id="search-input">
+        </div>
+        <div style="overflow-y: auto; flex-grow: 1;" id="notes-list">
+            <!-- Items -->
+        </div>
+    </div>
+
+    <div id="editor-pane">
+        <div class="toolbar">
+            <button onclick="saveNote()" title="Save (Append Only)"><span class="material-icons-round">save</span></button>
+            <button onclick="createNew()" title="New Note"><span class="material-icons-round">create</span></button>
+            <button onclick="deleteNote()" title="Delete"><span class="material-icons-round">delete</span></button>
+        </div>
+        <div id="empty-state" style="margin-top: 20%; text-align: center; color: var(--text-secondary);">
+            Select a note or create a new one.
+        </div>
+        <textarea id="note-editor" style="display: none;"></textarea>
+    </div>
+
+<script>
+    let notesData = [];
+    let activeNoteId = null;
+
+    document.addEventListener('DOMContentLoaded', () => {
+        fetchNotes();
+        
+        document.getElementById('search-input').addEventListener('input', (e) => {
+            renderList(e.target.value);
+        });
+    });
+
+    async function fetchNotes() {
+        try {
+            const res = await fetch('/api/v1/notes');
+            const data = await res.json();
+            if(data.error) {
+                alert(data.error);
+                return;
+            }
+            notesData = data;
+            // Sort by modified desc
+            notesData.sort((a,b) => (b.modified || 0) - (a.modified || 0));
+            renderList();
+        } catch(e) {
+            console.error(e);
+        }
+    }
+
+    function renderList(filter = '') {
+        const container = document.getElementById('notes-list');
+        container.innerHTML = '';
+        
+        const filtered = notesData.filter(n => 
+            n.title.toLowerCase().includes(filter.toLowerCase()) || 
+            n.body.toLowerCase().includes(filter.toLowerCase())
+        );
+
+        filtered.forEach(note => {
+            const div = document.createElement('div');
+            div.className = `note-item ${note.id === activeNoteId ? 'active' : ''}`;
+            div.onclick = () => selectNote(note.id);
+            
+            const dateStr = note.modified ? new Date(note.modified).toLocaleDateString() : '';
+            
+            div.innerHTML = `
+                <div class="note-title">${note.title}</div>
+                <div class="note-date">${dateStr}</div>
+                <div class="note-preview">${note.body.substring(0, 50)}</div>
+            `;
+            container.appendChild(div);
+        });
+    }
+
+    function selectNote(id) {
+        activeNoteId = id;
+        renderList(document.getElementById('search-input').value); // Update active state class
+        
+        const note = notesData.find(n => n.id === id);
+        if (note) {
+            document.getElementById('empty-state').style.display = 'none';
+            const editor = document.getElementById('note-editor');
+            editor.style.display = 'block';
+            
+            // Full content
+            // Assuming plain text for now
+            editor.value = note.body;
+        }
+    }
+
+    function createNew() {
+        alert("Create Note functionality coming soon.");
+    }
+
+    function saveNote() {
+        alert("Edit/Save is read-only currently due to encryption complexity.");
+    }
+    
+    function deleteNote() {
+        alert("Delete functionality coming soon.");
+    }
+
+</script>
+</body>
+</html>
