@@ -6,6 +6,8 @@ import time
 import json
 import threading
 from fuse import FUSE, FuseOSError, Operations
+from src.integrations.apple_reminders import AppleReminders
+from src.integrations.apple_notes import AppleNotes
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,11 @@ class RealCloudFS(Operations):
         self.api = api
         self.root_cache = root_cache_dir
         self.local_mappings = local_mappings or {} 
+        
+        # Integrations
+        self.reminders = AppleReminders(api)
+        self.notes = AppleNotes(api)
+        self.virtual_file_cache = {} # { path: {'content': bytes, 'timestamp': float} }
         
         # Cache for directory listings to avoid API spam
         # Structure: { '/path/to/dir': {timestamp: 123, children: ['Name1', 'Name2']} }
@@ -163,7 +170,7 @@ class RealCloudFS(Operations):
         Get file attributes.
         """
         # Filter out common OS noise to avoid API spam
-        # Photos is removed, so we explicitly ignore it here to stop the OS from probing it repeatedly
+        # We allow /Notes because it is a local protected folder
         ignored_paths = {'/Photos', '/.Trash', '/.hidden', '/.Trash-1000'}
         if path in ignored_paths or path.startswith('/Photos/'):
             raise FuseOSError(errno.ENOENT)
@@ -189,6 +196,70 @@ class RealCloudFS(Operations):
             self.getattr_cache[path] = {'timestamp': now, 'attrs': attrs}
             return attrs
             
+        # --- Virtual Folders ---
+        if path == '/Reminders':
+            attrs = dict(st_mode=(stat.S_IFDIR | 0o777), st_nlink=2, st_size=0, st_ctime=now, st_mtime=now, st_atime=now)
+            return attrs
+            
+        if path.startswith('/Reminders/'):
+            # It's a reminder list file
+            list_filename = path[len('/Reminders/'):] # e.g. "MyList.md"
+            if list_filename.endswith('.md'):
+                list_name = list_filename[:-3].replace('_', '/') # rudimentary unsanitize
+                
+                # Check cache
+                if path in self.virtual_file_cache and (now - self.virtual_file_cache[path]['timestamp'] < 30):
+                    content = self.virtual_file_cache[path]['content']
+                else:
+                    # Generate content
+                    text = self.reminders.get_list_as_markdown(list_name)
+                    content = text.encode('utf-8')
+                    self.virtual_file_cache[path] = {'content': content, 'timestamp': now}
+                
+                attrs = dict(st_mode=(stat.S_IFREG | 0o444), st_nlink=1, st_size=len(content), st_ctime=now, st_mtime=now, st_atime=now)
+                return attrs
+            else:
+                 raise FuseOSError(errno.ENOENT)
+        
+        if path == '/Notes':
+             attrs = dict(st_mode=(stat.S_IFDIR | 0o777), st_nlink=2, st_size=0, st_ctime=now, st_mtime=now, st_atime=now)
+             return attrs
+
+        if path.startswith('/Notes/'):
+            filename = path[len('/Notes/'):]
+            if filename.endswith('.txt'):
+                # Reverse lookup title from filename? 
+                # Or refresh and find match.
+                # Filename is sanitized title.
+                
+                # Check cache first
+                if path in self.virtual_file_cache and (now - self.virtual_file_cache[path]['timestamp'] < 60):
+                    content = self.virtual_file_cache[path]['content']
+                else:
+                    # Find note
+                    target_note = None
+                    notes_list = self.notes.list_notes()
+                    for note in notes_list:
+                        title = note.get('title', 'Untitled')
+                        safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_')]).strip()
+                        if not safe_title: safe_title = f"Note_{note['id']}"
+                        
+                        if f"{safe_title}.txt" == filename:
+                            target_note = note
+                            break
+                    
+                    if target_note:
+                        text = f"Title: {target_note['title']}\n\n{target_note['body']}"
+                        content = text.encode('utf-8')
+                        self.virtual_file_cache[path] = {'content': content, 'timestamp': now}
+                    else:
+                        raise FuseOSError(errno.ENOENT)
+
+                attrs = dict(st_mode=(stat.S_IFREG | 0o444), st_nlink=1, st_size=len(content), st_ctime=now, st_mtime=now, st_atime=now)
+                return attrs
+            else:
+                raise FuseOSError(errno.ENOENT)
+
         # 2. Check Local Mappings
         local_path = self._get_local_mapped_path(path)
         if local_path and os.path.exists(local_path):
@@ -332,6 +403,10 @@ class RealCloudFS(Operations):
             # We only do this if the remote listing was successful (entries is not empty or we trust it)
             # Actually, if the folder is empty remotely, entries will be empty.
             
+            # CRITICAL: Do NOT prune inside locally managed integration folders
+            if path.startswith('/LinuxSync') or path.startswith('/Notes'):
+                return
+
             try:
                 local_cache_path = os.path.join(self.root_cache, path.lstrip('/'))
                 if os.path.isdir(local_cache_path):
@@ -340,12 +415,13 @@ class RealCloudFS(Operations):
                     # Protected system files that exist locally but not remotely
                     protected_files = {
                         'dir_structure.json', 
-                        'reminders.json', 
-                        'contacts.vcf', 
                         '.clipboard',
                         'LinuxSync',
-                        'Notes',
-                        'cloud_map.json'
+                        'cloud_map.json',
+                        'contacts.vcf',
+                        'reminders.json',
+                        'Reminders.md',
+                        'Notes'
                     }
 
                     for f in local_files:
@@ -405,6 +481,37 @@ class RealCloudFS(Operations):
         if clean_path == '/':
             logger.debug(f"readdir called for root ('/'), clean_path: {clean_path}")
             logger.debug(f"Initial entries for root: {entries}")
+            
+            # Add Virtual Folders
+            entries.add('Reminders')
+            entries.add('Notes') # Placeholder
+
+        # Virtual: Reminders
+        if clean_path == '/Reminders':
+            lists = self.reminders.list_folders()
+            for l_name in lists:
+                # Sanitize filename
+                safe_name = l_name.replace('/', '_') + '.md'
+                entries.add(safe_name)
+            
+            for name in entries:
+                if name in ('.', '..'): yield (name, None, 0)
+                else: yield (name, None, 0)
+            return
+
+        # Virtual: Notes
+        if clean_path == '/Notes':
+            notes_list = self.notes.list_notes()
+            for note in notes_list:
+                # Sanitize
+                title = note.get('title', 'Untitled')
+                safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_')]).strip()
+                if not safe_title: safe_title = f"Note_{note['id']}"
+                entries.add(f"{safe_title}.txt")
+            
+            for name in entries:
+                yield (name, None, 0)
+            return
 
         # 1. Add Local Mapped Files
         parts = [p for p in path.split('/') if p]
@@ -528,6 +635,21 @@ class RealCloudFS(Operations):
         """
         Read data from a file.
         """
+        # Virtual File Read (Reminders & Notes)
+        if path.startswith('/Reminders/') or path.startswith('/Notes/'):
+            if path in self.virtual_file_cache:
+                content = self.virtual_file_cache[path]['content']
+                return content[offset:offset+length]
+            else:
+                # Should have been populated by getattr
+                # Try to regenerate
+                try:
+                    self.getattr(path)
+                    content = self.virtual_file_cache[path]['content']
+                    return content[offset:offset+length]
+                except:
+                    return b""
+
         # 1. Read from Local Mapping (Direct Passthrough)
         local_mapped = self._get_local_mapped_path(path)
         if local_mapped and os.path.exists(local_mapped):
@@ -946,6 +1068,64 @@ class RealCloudFS(Operations):
                 del self.pending_uploads[path]
         except Exception as e:
             logger.error(f"unlink error for {path}: {e}")
+            raise FuseOSError(errno.EIO)
+
+    def rmdir(self, path):
+        """Attempt to delete remote folder; also remove local cache."""
+        logger.debug(f"rmdir requested for {path}")
+        try:
+            # 1. Delete Remotely
+            node = self._get_node(path)
+            if node and node is not NODE_NOT_FOUND and hasattr(node, 'delete'):
+                try:
+                    node.delete()
+                    logger.info(f"Deleted remote folder {path}")
+                except Exception as e:
+                    logger.error(f"Remote rmdir failed for {path}: {e}")
+                    # If remote fail, maybe it's not empty or permission. 
+                    # We continue to try local cleanup if appropriate, but usually we should raise if remote fails.
+                    raise FuseOSError(errno.EIO)
+
+            # 2. Delete Locally
+            local_path = os.path.join(self.root_cache, path.lstrip('/'))
+            if os.path.exists(local_path):
+                try:
+                    os.rmdir(local_path)
+                except OSError as e:
+                    # Local might not be empty if sync hasn't pruned it yet?
+                    # Or simple rmdir fails if files exist.
+                    logger.warning(f"Local rmdir failed for {local_path}: {e}")
+                    # We might want to force clean if we know remote is gone?
+                    # For now, let's leave it to sync pruning.
+
+            # 3. Update Parent Cache
+            parts = [p for p in path.split('/') if p]
+            parent = '/' if len(parts) <= 1 else '/' + '/'.join(parts[:-1])
+            name = parts[-1] if parts else ''
+            
+            try:
+                if parent in self.dir_cache:
+                    children = set(self.dir_cache[parent].get('children', []))
+                    if name in children:
+                        children.remove(name)
+                        self.dir_cache[parent]['children'] = list(children)
+                        self.dir_cache[parent]['timestamp'] = time.time()
+            except Exception:
+                pass
+
+            # Clear caches
+            if path in self.node_cache:
+                del self.node_cache[path]
+            if path in self.getattr_cache:
+                del self.getattr_cache[path]
+            # Add to negative cache to prevent immediate reappear
+            self.negative_node_cache[path] = time.time()
+
+            return 0
+        except FuseOSError:
+            raise
+        except Exception as e:
+            logger.error(f"rmdir error for {path}: {e}")
             raise FuseOSError(errno.EIO)
 
     def mkdir(self, path, mode):

@@ -3,10 +3,6 @@ import logging
 from flask import Flask, request, jsonify, render_template
 import threading
 from src.device_status import get_devices, play_sound
-from src.integrations.siri_control import handle_command
-from src.backup import backup_dotfiles
-from src.focus_sync import focus_manager
-from src.reading_list import export_reading_list
 import src.metadata_crawler # Import the module to access the global crawler instance
 
 logger = logging.getLogger(__name__)
@@ -72,9 +68,9 @@ def trigger_full_sync():
             logger.info("Full Sync Complete.")
             
             # Re-index after sync
-            global brain
-            if brain: 
-                brain.index_files()
+            # global brain
+            # if brain: 
+            #    brain.index_files()
                 
         except Exception as e:
             logger.error(f"Full Sync Failed: {e}")
@@ -82,101 +78,9 @@ def trigger_full_sync():
     threading.Thread(target=download_worker, daemon=True).start()
     return jsonify({"status": "started", "message": "Full download started in background. Check logs."})
 
-@app.route('/api/v1/readinglist', methods=['POST'])
-def sync_reading_list():
-    """
-    Triggers Safari Tabs export
-    """
-    if not API_CLIENT:
-        return jsonify({"error": "Offline"}), 503
-        
-    local_cache = os.path.expanduser("~/.cache/icloud_sync")
-    count, path = export_reading_list(API_CLIENT, local_cache)
-    
-    if path:
-        return jsonify({"status": "success", "count": count, "path": path})
-    else:
-        return jsonify({"status": "empty", "message": "No tabs found or API error"})
-
-@app.route('/api/v1/focus', methods=['POST'])
-def focus_mode():
-    """
-    Receives Focus Mode updates (DND)
-    """
-    return jsonify(focus_manager.handle_api_request(request.json))
-
 @app.route('/')
 def dashboard():
     return render_template('dashboard.html')
-
-@app.route('/api/v1/command', methods=['POST'])
-def siri_command():
-    """
-    Receives Siri Commands (Lock, Backup, etc.)
-    """
-    data = request.json
-    cmd = data.get('cmd', '')
-    args = data.get('args', [])
-    
-    if not cmd:
-        return jsonify({"error": "No command provided"}), 400
-        
-    result = handle_command(cmd, args)
-    
-    # Handle special signals that need Server Context (like SYNC_ROOT)
-    if result.get('status') == 'signal' and result.get('signal') == 'backup':
-        try:
-            # 1. Backup to Local Cache (Avoid FUSE RO Error)
-            local_cache = os.path.expanduser("~/.cache/icloud_sync")
-            count, backup_dir = backup_dotfiles(local_cache)
-            
-            msg = f"Local Backup: {count} files saved to {backup_dir}."
-            
-            # 2. Upload to Real iCloud (if connected)
-            if API_CLIENT:
-                try:
-                    # Ensure 'LinuxBackups' folder exists in Drive root
-                    folder_name = "LinuxBackups"
-                    drive_root = API_CLIENT.drive
-                    
-                    backup_folder = None
-                    try:
-                        # Try to get the folder directly
-                        backup_folder = drive_root[folder_name]
-                    except (KeyError, Exception):
-                        # If not found, create it
-                        logger.info(f"Creating remote folder: {folder_name}")
-                        drive_root.mkdir(folder_name)
-                        
-                        # Force refresh of the directory list so the new folder appears
-                        drive_root.dir() 
-                        
-                        # Now try to get it again
-                        backup_folder = drive_root[folder_name]
-                    
-                    uploaded = 0
-                    for filename in os.listdir(backup_dir):
-                        file_path = os.path.join(backup_dir, filename)
-                        if os.path.isfile(file_path):
-                            # Check if file already exists remotely? 
-                            # For simplicity, we try to upload. 
-                            # pyicloud might raise if exists or overwrite.
-                            # Usually simple upload works.
-                            with open(file_path, 'rb') as f:
-                                backup_folder.upload(f)
-                                uploaded += 1
-                                
-                    msg += f" Uploaded {uploaded} to iCloud."
-                except Exception as e:
-                    logger.error(f"Cloud Upload failed: {e}")
-                    msg += f" (Cloud Upload failed: {str(e)})"
-            
-            return jsonify({"status": "success", "message": msg})
-        except Exception as e:
-            logger.error(f"Backup failed: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
-
-    return jsonify(result)
 
 @app.route('/api/v1/status', methods=['GET'])
 def status():
@@ -214,7 +118,7 @@ def status():
 
     return jsonify({
         "status": "running",
-        "service": "UnixSync-Bridge",
+        "service": "Orchard-Bridge",
         "sync_root": SYNC_ROOT,
         "user": user,
         "devices": devices

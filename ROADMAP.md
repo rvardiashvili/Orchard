@@ -5,33 +5,36 @@ This document outlines the requirements, architecture, and features for a Linux-
 ## 1. Core Requirements Checklist
 
 ### Authentication & Connection
-- [ ] **iCloud Login Handler:** Securely handle Apple ID and Password.
-- [ ] **2FA Management:** Support for Two-Factor Authentication (handling SMS/Device codes).
-- [ ] **Session Persistence:** Store session cookies/tokens to avoid frequent re-logins.
-- [ ] **Secure Storage:** Use Linux Keyring (via `keyring` library) to store credentials, avoiding plain text passwords.
+- [x] **iCloud Login Handler:** Securely handle Apple ID and Password.
+- [x] **2FA Management:** Support for Two-Factor Authentication (handling SMS/Device codes).
+- [ ] **Session Persistence:** Store session cookies/tokens to avoid frequent re-logins. (Currently broken - requires re-login on reboot).
+- [x] **Secure Storage:** Use Linux Keyring (via `keyring` library) to store credentials.
 
 ### File Synchronization (iCloud Drive)
-- [ ] **FUSE Filesystem (Virtual Files):** 
-    - Implement a FUSE driver (using `fusepy` or `pyfuse3`).
+- [x] **FUSE Filesystem (Virtual Files):** 
+    - Implement a FUSE driver (using `fusepy`).
     - Files appear in the directory structure but content is fetched on demand (streaming).
-- [ ] **Local Cache:** Maintain a local cache for frequently accessed files to improve performance.
+- [x] **Local Cache:** Maintain a local cache for frequently accessed files to improve performance.
 - [ ] **Two-Way Sync:**
-    - Watch for local file changes (using `inotify` or `watchdog`).
-    - Push changes to iCloud.
-    - Poll or listen for remote changes from iCloud.
+    - [x] **Uploads:** Changes to local files are pushed to iCloud on file close.
+    - [ ] **Remote Poll:** Watch for remote changes from iCloud (currently relies on cache TTL).
 - [ ] **Directory Mapping:** Ability to map specific local folders (e.g., `~/Documents`, `~/Pictures`) to iCloud folders.
 
 ### Service Synchronization
-- [ ] **Calendar:** Sync via standard CalDAV protocol.
-- [ ] **Reminders:** Sync via CalDAV (Reminders are often exposed as tasks in CalDAV).
-- [ ] **Contacts:** Sync via CardDAV protocol.
-- [ ] **Notes:** Access via API (likely `pyicloud` web interface wrapper as Notes doesn't use standard IMAP anymore).
+- [ ] **Calendar:** Sync via standard CalDAV protocol. (Requires App-Specific Password strategy).
+- [x] **Reminders:** 
+    - **Implemented (Read-Only):** Reverse-engineered CloudKit API to fetch lists and tasks.
+    - **Format:** Exposed as Markdown files (`/Reminders/MyList.md`).
+- [ ] **Contacts:** Sync via CardDAV protocol. (Prototype only).
+- [x] **Notes:** 
+    - **Implemented (Read-Only):** Reverse-engineered CloudKit/Protobuf format.
+    - **Format:** Exposed as Text files (`/Notes/Title.txt`).
+    - **Content:** Heuristic extraction of text body; attachments detected but not downloaded.
 
 ### Constraints & Logic
-- [ ] **File Size Limits:**
+- [x] **File Size Limits:**
     - Configurable threshold (e.g., "Auto-download files < 50MB").
-    - Larger files appear as 0-byte placeholders or proprietary pointers until explicitly requested.
-- [ ] **Selective Sync:** Configuration file to include/exclude specific paths.
+- [ ] **Selective Sync:** Configuration file to include/exclude specific paths. (Config exists but VFS enforcement is incomplete).
 
 ## 2. Architecture Plan
 
@@ -41,14 +44,23 @@ This document outlines the requirements, architecture, and features for a Linux-
     - `pyicloud`: For general API access (Drive, Find My iPhone, basic services).
     - `fusepy`: For creating the virtual filesystem.
     - `watchdog`: For monitoring local file system events.
-    - `caldav`: For Calendar/Reminders.
+    - `flask`: For the local API bridge.
+    - `caldav`: For Calendar/Reminders (Planned).
     - `keyring`: For credential storage.
 
 **Components:**
-1.  **`auth_manager.py`**: Handles login and session saving.
-2.  **`fs_driver.py`**: The FUSE implementation. Intercepts file open/read calls.
-3.  **`sync_daemon.py`**: Background process (Systemd service) monitoring for changes.
-4.  **`config.yaml`**: User configuration (folders to sync, size limits).
+1.  **`src/auth.py`**: Handles login and session saving.
+2.  **`src/vfs.py`**: The FUSE implementation (Orchard Core).
+3.  **`src/api_server.py`**: Local API Bridge for iOS Shortcuts integration.
+4.  **`src/services_sync.py`**: (Deprecated/Placeholder) Needs rewrite for Calendar, Contacts, Reminders.
+5.  **`config/settings.yaml`**: User configuration.
+
+## 3. Current Status
+**Orchard is Live (Alpha).** 
+- Core FUSE filesystem is stable.
+- Local API bridge is functional.
+- **Service Sync (Contacts/Calendar/Notes) is currently disabled/non-functional.**
+- "Photos" and "Notes" are filtered out of the file view to avoid system errors.
 
 ## 4. Ecosystem Continuity (The "Apple Feel")
 These features aim to replicate the "It just works" continuity between Apple devices, using Linux as a first-class citizen.

@@ -7,7 +7,7 @@ from src.vfs import mount_daemon
 from src.tray import start_tray # Import Tray
 from src.metadata_crawler import MetadataCrawler, crawler # Import Crawler
 from src.watchers import start_watcher
-from src.services_sync import sync_calendar, sync_reminders, export_contacts, sync_notes
+from src.integrations.sync_worker import sync_all_services
 import argparse
 import os
 import sys
@@ -28,7 +28,17 @@ def load_config(config_path="config/settings.yaml"):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-# ... (omitted code) ...
+def service_sync_loop(api, cache_dir):
+    """
+    Background loop to sync Contacts, Calendar, Reminders, Notes.
+    """
+    while True:
+        try:
+            sync_all_services(api, cache_dir)
+        except Exception as e:
+            logger.error(f"Service Sync Failed: {e}")
+            
+        time.sleep(1800) # 30 mins
 
 def main():
     parser = argparse.ArgumentParser(description="Orchard: iCloud Sync Service for Linux")
@@ -46,7 +56,9 @@ def main():
         username = input("Please enter your iCloud username (email): ")
         config['username'] = username # Potentially save to config later or just use for this run
     
-    auth_mgr = AuthManager(username)
+    # Store session/auth in ~/.config/icloud_sync (standard config location)
+    auth_dir = os.path.expanduser("~/.config/icloud_sync")
+    auth_mgr = AuthManager(username, cookie_dir=auth_dir)
     api = None
     
     if args.login:
@@ -85,12 +97,9 @@ def main():
     # Start API with the Real API Client (or None if offline)
     start_server(sync_root, api, port=8080)
 
-    # 3. Start Hardware Bridges
-    run_hardware_integrations()
-    
-    # 3.1 Start Service Sync Loop
+    # 3. Start Service Sync Loop
     threading.Thread(target=service_sync_loop, args=(api, cache_dir), daemon=True).start()
-    
+
     # 3.5 Start System Tray (if not headless)
     stop_event = threading.Event()
     if not args.headless:

@@ -5,6 +5,9 @@
 ## Features
 
 *   **iCloud Drive FUSE Mount:** Access your iCloud files as if they were local. Reads and writes are cached and synced in the background.
+*   **Notes & Reminders Sync:** 
+    *   **Reminders:** View your lists as Markdown files (`[ ] Task`).
+    *   **Notes:** Access your notes as plain text files. (Powered by custom CloudKit reverse-engineering).
 *   **Smart Caching:** Files are cached locally for performance and offline access, with graceful eviction to save disk space.
 *   **System Integration:**
     *   **Handoff:** Open URLs from your iPhone directly in your Linux browser.
@@ -41,6 +44,7 @@ Configuration is stored in `config/settings.yaml`. You can customize:
 
 Orchard uses a modular design:
 *   **Orchard Core (`src/vfs.py`):** A custom FUSE filesystem handling file operations.
+*   **CloudKit Integrations (`src/integrations/`):** Custom modules (`apple_reminders.py`, `apple_notes.py`) that reverse-engineer the web API to fetch app data.
 *   **API Bridge (`src/api_server.py`):** A local HTTP server that accepts commands from iOS Shortcuts.
 *   **Watchers (`src/watchers.py`):** Monitors the filesystem for changes to trigger clipboard and handoff events.
 
