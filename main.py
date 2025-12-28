@@ -95,7 +95,7 @@ def main():
     watcher = start_watcher(cache_dir)
 
     # Start API with the Real API Client (or None if offline)
-    start_server(sync_root, api, port=8080)
+    start_server(sync_root, api, port=8080, cache_dir=cache_dir)
 
     # 3. Start Service Sync Loop
     threading.Thread(target=service_sync_loop, args=(api, cache_dir), daemon=True).start()

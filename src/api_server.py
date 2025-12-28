@@ -1,6 +1,6 @@
 import os
 import logging
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_from_directory
 import threading
 from src.device_status import get_devices, play_sound
 import src.metadata_crawler # Import the module to access the global crawler instance
@@ -198,10 +198,35 @@ def open_url():
         logger.error(f"Handoff error: {e}")
         return jsonify({"error": str(e)}), 500
 
-def start_server(sync_root_path, api_client, port=8080):
-    global SYNC_ROOT, API_CLIENT
+CACHE_DIR = os.path.expanduser("~/.cache/icloud_sync")
+
+@app.route('/api/v1/calendar.ics', methods=['GET'])
+def get_calendar_ics():
+    """
+    Serve the synchronized Calendar.ics file.
+    Usage: Add 'http://localhost:8080/api/v1/calendar.ics' as a Network Calendar.
+    """
+    try:
+        return send_from_directory(CACHE_DIR, 'Calendar.ics', mimetype='text/calendar')
+    except Exception as e:
+        return jsonify({"error": "Calendar not found or not synced yet."}), 404
+
+@app.route('/api/v1/contacts.vcf', methods=['GET'])
+def get_contacts_vcf():
+    """
+    Serve the synchronized contacts.vcf file.
+    """
+    try:
+        return send_from_directory(CACHE_DIR, 'contacts.vcf', mimetype='text/vcard')
+    except Exception as e:
+        return jsonify({"error": "Contacts not found or not synced yet."}), 404
+
+def start_server(sync_root_path, api_client, port=8080, cache_dir=None):
+    global SYNC_ROOT, API_CLIENT, CACHE_DIR
     SYNC_ROOT = sync_root_path
     API_CLIENT = api_client
+    if cache_dir:
+        CACHE_DIR = cache_dir
     
     def run():
         logger.info(f"Starting Local API Bridge on port {port}")

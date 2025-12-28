@@ -11,12 +11,20 @@
     *   **Calendar:** View events as Markdown summaries and standard `.ics` exports.
     *   **Contacts:** Auto-export contacts to standard `.vcf` format (with photos).
 *   **Smart Caching:** Files are cached locally for performance and offline access, with graceful eviction to save disk space.
-*   **System Integration:**
-    *   **Handoff:** Open URLs from your iPhone directly in your Linux browser.
-    *   **Universal Clipboard:** Copy on your iPhone, paste on Linux (and vice versa).
-    *   **Shortcuts Integration:** Trigger Linux commands (like "Lock Screen") from iOS Shortcuts.
-*   **Hardware Bridges:** (Experimental) Integration for Continuity Camera and AirPlay.
-*   **Metadata Search:** Fast, local indexing of your cloud files for instant search results.
+
+## Desktop Integration (Automatic Import)
+
+To seamlessly integrate with Linux desktop applications:
+
+*   **Calendar:** 
+    1. Open your Calendar app (GNOME Calendar, Thunderbird, KOrganizer).
+    2. Add a new "Network Calendar" or "Calendar from the Web".
+    3. Enter the URL: `http://localhost:8080/api/v1/calendar.ics`
+    4. Set refresh rate to 30 minutes.
+
+*   **Contacts:**
+    *   Download or link to `http://localhost:8080/api/v1/contacts.vcf`.
+    *   (Most Linux Contact apps do not support live subscription to a VCF file yet, but you can script a periodic import).
 
 ## Installation
 
