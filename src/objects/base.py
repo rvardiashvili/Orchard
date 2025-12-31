@@ -12,35 +12,109 @@ from src.config.sync_states import (
 
 logger = logging.getLogger(__name__)
 
+class CloudState:
+    """Represents the state of the object as known on Apple's servers."""
+    def __init__(self, row):
+        self.id = row.get('cloud_id')
+        self.parent_id = row.get('cloud_parent_id')
+        self.etag = row.get('etag')
+        self.modified_at = row.get('cloud_modified_at')
+        self.revision = row.get('revision')
+        self.missing = row.get('missing_from_cloud', 0)
+
+class LocalState:
+    """Represents the state of the object on the local device."""
+    def __init__(self, row):
+        self.parent_id = row.get('parent_id')
+        self.name = row.get('name', 'Untitled')
+        self.extension = row.get('extension')
+        self.size = row.get('size', 0)
+        self.modified_at = row.get('local_modified_at', 0)
+        self.dirty = row.get('dirty', 0)
+        self.sync_state = row.get('sync_state', 'synced')
+        self.origin = row.get('origin', 'local')
+        
+        # Filesystem specific (will be populated by subclasses if applicable)
+        self.path = None
+        self.present = 0
+        self.last_accessed = 0
+        self.open_count = 0
+
 class OrchardObject:
     def __init__(self, db: OrchardDB, row=None):
-        _row_dict = dict(row) if row else {} 
         self.db = db
+        _row_dict = dict(row) if row else {} 
+        
         self.id = _row_dict.get('id')
         self.type = _row_dict.get('type', 'unknown')
-        self.name = _row_dict.get('name', 'Untitled')
-        self.parent_id = _row_dict.get('parent_id')
         
-        self.local_modified_at = _row_dict.get('local_modified_at', 0)
-        self.cloud_modified_at = _row_dict.get('cloud_modified_at', 0)
-        self.size = row['size'] if row else 0 
-        self.extension = row['extension'] if row and 'extension' in row else None 
+        # Initialize State Objects
+        self.cloud = CloudState(_row_dict)
+        self.local = LocalState(_row_dict)
         
-        self.etag = _row_dict.get('etag')
-        self.revision = _row_dict.get('revision') # New: Cloud Revision ID
-        self.origin = _row_dict.get('origin', 'local') # New: 'local' or 'cloud'
-        self.dirty = _row_dict.get('dirty', 0)
-        self.sync_state = _row_dict.get('sync_state', 'synced') # Ensure sync_state is initialized
-        
+        # Keep raw row for debugging if needed
         self._row_data = _row_dict
+
+    # --- Properties for Backward Compatibility & Convenience ---
+    
+    @property
+    def cloud_id(self): return self.cloud.id
+    @cloud_id.setter
+    def cloud_id(self, val): self.cloud.id = val
+
+    @property
+    def cloud_parent_id(self): return self.cloud.parent_id
+    @cloud_parent_id.setter
+    def cloud_parent_id(self, val): self.cloud.parent_id = val
+
+    @property
+    def etag(self): return self.cloud.etag
+    @etag.setter
+    def etag(self, val): self.cloud.etag = val
+    
+    @property
+    def parent_id(self): return self.local.parent_id
+    @parent_id.setter
+    def parent_id(self, val): self.local.parent_id = val
+
+    @property
+    def name(self): return self.local.name
+    @name.setter
+    def name(self, val): self.local.name = val
+
+    @property
+    def extension(self): return self.local.extension
+    @extension.setter
+    def extension(self, val): self.local.extension = val
+
+    @property
+    def size(self): return self.local.size
+    @size.setter
+    def size(self, val): self.local.size = val
+
+    @property
+    def local_modified_at(self): return self.local.modified_at
+    @local_modified_at.setter
+    def local_modified_at(self, val): self.local.modified_at = val
+
+    @property
+    def dirty(self): return self.local.dirty
+    @dirty.setter
+    def dirty(self, val): self.local.dirty = val
+    
+    @property
+    def sync_state(self): return self.local.sync_state
+    @sync_state.setter
+    def sync_state(self, val): self.local.sync_state = val
+
+    # --- Methods ---
 
     @classmethod
     def load(cls, db, object_id):
         row = db.fetchone("SELECT * FROM objects WHERE id = ?", (object_id,))
         if not row: return None
         
-        # Drive-Only Factory
-        # Imports inside method to avoid circular imports
+        # Drive-Only Factory (Lazy import to avoid circular dependency)
         from src.objects.drive import DriveFile, DriveFolder
 
         otype = row['type']
@@ -53,7 +127,6 @@ class OrchardObject:
 
     def list_children(self):
         """Returns list of child objects."""
-        # Query for IDs so we can load full objects using the factory
         rows = self.db.fetchall("SELECT id FROM objects WHERE parent_id = ?", (self.id,))
         children = []
         for r in rows:
@@ -63,20 +136,29 @@ class OrchardObject:
         return children
 
     def commit(self):
-        """Persist metadata changes to DB and mark dirty, setting sync_state to pending_push."""
+        """Persist ALL local state changes to DB immediately."""
         now = int(time.time())
         self.db.execute("""
             UPDATE objects SET 
                 name = ?, 
                 extension = ?, 
+                parent_id = ?,   -- CRITICAL: Persist move operations
+                size = ?,        -- CRITICAL: Persist size changes
                 local_modified_at = ?,
                 dirty = 1,
-                sync_state = ?, -- Changed to use parameter
-                revision = ?, -- Include revision in update
-                origin = ? -- Include origin in update
+                sync_state = ?, 
+                revision = ?, 
+                origin = ? 
             WHERE id = ?
-        """, (self.name, self.extension, now, SYNC_STATE_PENDING_PUSH, self.revision, self.origin, self.id))
-        
-        # We NO LONGER enqueue generic sync here. 
-        # Specific actions (rename, move, upload) are enqueued by OrchardFS or Engine.
-        logger.debug(f"Committed {self.name} (ID: {self.id})")
+        """, (
+            self.local.name, 
+            self.local.extension, 
+            self.local.parent_id,
+            self.local.size,
+            now, 
+            SYNC_STATE_PENDING_PUSH, 
+            self.cloud.revision, 
+            self.local.origin, 
+            self.id
+        ))
+        logger.debug(f"Committed local state for {self.local.name} (ID: {self.id})")
