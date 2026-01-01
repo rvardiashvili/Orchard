@@ -6,6 +6,7 @@ import json
 import uuid
 import shutil
 import tempfile
+import requests
 
 from src.db.orchardDB import OrchardDB
 from src.icloud_client.icloud_drive import iCloudDrive, CLOUD_DOCS_ZONE_ID_ROOT
@@ -30,15 +31,7 @@ class SyncEngine:
         self.running = False
         self.drive_svc: iCloudDrive = None
         
-        if self.api and self.api.authenticated:
-            try:
-                ds_root = self.api.get_webservice_url("drivews")
-                doc_root = self.api.get_webservice_url("docws")
-                if ds_root and doc_root:
-                    self.drive_svc = iCloudDrive(self.api.session, ds_root, doc_root, self.api._pyicloud_service.params)
-                    logger.info("iCloudDrive service initialized.")
-            except Exception as e:
-                logger.error(f"Failed to initialize Drive service: {e}", exc_info=True)
+        # Initial setup handled in _ensure_service called by start/_loop
 
     def start(self):
         self.running = True
@@ -48,18 +41,69 @@ class SyncEngine:
     def stop(self):
         self.running = False
 
-    def _loop(self):
-        if self.drive_svc: self._pull_metadata()
+    def _ensure_service(self):
+        """Checks if drive service is available; attempts to reconnect if not."""
+        if self.drive_svc:
+            return True
+
+        try:
+            if self.api:
+                # If started offline, we might not be authenticated yet.
+                if not self.api.authenticated:
+                    logger.info("Client not authenticated. Attempting to authenticate...")
+                    try:
+                        self.api.authenticate()
+                        if not self.api.authenticated:
+                            logger.warning("Authentication attempt failed. Remaining offline.")
+                            return False
+                    except Exception as auth_e:
+                        logger.warning(f"Authentication failed: {auth_e}")
+                        return False
+
+                # Refresh session if needed (implementation dependent, usually handled by pyicloud)
+                # But we need to ensure we can talk to the API
+                logger.info("Attempting to connect to iCloud Drive...")
+                
+                ds_root = self.api.get_webservice_url("drivews")
+                doc_root = self.api.get_webservice_url("docws")
+                
+                if ds_root and doc_root:
+                    self.drive_svc = iCloudDrive(self.api.session, ds_root, doc_root, self.api._pyicloud_service.params)
+                    logger.info("iCloudDrive service connected/restored.")
+                    
+                    # Requirement 1: Perform sync on internet back
+                    self._pull_metadata()
+                    return True
+        except Exception as e:
+            logger.debug(f"Connection attempt failed: {e}")
         
+        return False
+
+    def _loop(self):
         while self.running:
+            # Check Connection
+            if not self._ensure_service():
+                time.sleep(10) # Wait for internet
+                continue
+
             task = self._get_next_retryable_action()
             if task:
                 try:
                     self._process_task(task)
                     self.db.complete_action(task['action_id'])
                 except Exception as e:
-                    logger.error(f"Task {task['action_type']} (ID: {task['action_id']}) failed: {e}", exc_info=True)
-                    self.db.fail_action(task['action_id'], task['target_id'], str(e))
+                    err_str = str(e)
+                    # Network Error Detection
+                    if any(x in err_str for x in ["Connection", "Timeout", "503", "409", "socket", "Client Error"]):
+                        logger.warning(f"Network/Service error executing task {task['action_id']}: {e}. Pausing service for reconnection.")
+                        self.drive_svc = None # Force reconnection logic
+                        # Do NOT fail the action; it stays 'processing' (or we could reset to pending)
+                        # Ideally reset to pending so it's picked up again
+                        self.db.execute("UPDATE actions SET status='pending' WHERE action_id=?", (task['action_id'],))
+                        time.sleep(2) # Backoff slightly
+                    else:
+                        logger.error(f"Task {task['action_type']} (ID: {task['action_id']}) failed: {e}", exc_info=True)
+                        self.db.fail_action(task['action_id'], task['target_id'], str(e))
             else:
                 time.sleep(1)
 
@@ -146,8 +190,11 @@ class SyncEngine:
             logger.error(f"Failed to list directory {cloud_id}: {e}")
             return
 
+        # Update parent last_synced to prevent redundant pulls
+        self.db.execute("UPDATE objects SET last_synced=? WHERE id=?", (int(time.time()), local_parent_id))
+
         for item in items:
-            c_id = item.get('docwsid') or item.get('drivewsid')
+            c_id = item.get('drivewsid') or item.get('docwsid')
             if not c_id: continue
             
             etag = item.get('etag')
@@ -162,6 +209,14 @@ class SyncEngine:
             if existing:
                 if existing['dirty']: continue # Conflict check
                 
+                # Check for Etag Change
+                if existing['etag'] != etag:
+                    # Mark local cache as stale if it exists
+                    cache_row = self.db.fetchone("SELECT present_locally FROM drive_cache WHERE object_id=?", (existing['id'],))
+                    if cache_row and cache_row['present_locally']:
+                        logger.info(f"File {name} changed on cloud. Marking local cache stale.")
+                        self.db.execute("UPDATE drive_cache SET present_locally=0 WHERE object_id=?", (existing['id'],))
+
                 self.db.execute("""
                     UPDATE objects 
                     SET etag=?, name=?, extension=?, size=?, type=?, cloud_parent_id=?, last_synced=?, missing_from_cloud=0
@@ -190,14 +245,31 @@ class SyncEngine:
             return
 
         # Resolve Parent Cloud ID
-        parent_cloud_id = obj.local.parent_id
-        if obj.local.parent_id == 'drive_root': parent_cloud_id = CLOUD_DOCS_ZONE_ID_ROOT
+        parent_cloud_id = None
+        if obj.local.parent_id == 'drive_root': 
+            parent_cloud_id = CLOUD_DOCS_ZONE_ID_ROOT
+        else:
+            p_row = self.db.fetchone("SELECT cloud_id FROM objects WHERE id=?", (obj.local.parent_id,))
+            if p_row: parent_cloud_id = p_row['cloud_id']
         
         if not parent_cloud_id: raise Exception(f"Parent {obj.local.parent_id} has no cloud ID")
 
         full_name = target_name
         if obj.local.extension and not target_name.endswith(f".{obj.local.extension}"):
             full_name += f".{obj.local.extension}"
+
+        # Conflict Prevention: Delete existing remote file with same name
+        try:
+            children = self.drive_svc.list_directory(parent_cloud_id)
+            conflict_item = next((i for i in children if i.get('name') == full_name), None)
+            
+            if conflict_item:
+                c_id = conflict_item.get('docwsid', conflict_item.get('drivewsid'))
+                c_etag = conflict_item.get('etag')
+                logger.info(f"Pre-upload conflict: {full_name} exists (ID: {c_id}). Deleting remote to enforce Local Wins.")
+                self.drive_svc.delete_item(c_id, c_etag)
+        except Exception as e:
+            logger.warning(f"Error checking conflicts during upload: {e}")
 
         if isinstance(obj, DriveFile):
             local_cache_path = obj.get_local_full_path()
@@ -209,14 +281,47 @@ class SyncEngine:
                 symlink_path = os.path.join(temp_dir, full_name)
                 os.symlink(local_cache_path, symlink_path)
                 
-                resp = self.drive_svc.upload_file(symlink_path, parent_cloud_id)
-                
-                new_cloud_id = resp.get('document_id') or resp.get('docwsid')
-                new_etag = resp.get('etag')
-                new_size = resp.get('size')
-                
-                if new_cloud_id:
-                    self._update_db_and_shadow(obj, new_cloud_id, new_etag, new_size, target_hash, parent_cloud_id)
+                try:
+                    resp = self.drive_svc.upload_file(symlink_path, parent_cloud_id)
+                    
+                    new_cloud_id = resp.get('document_id') or resp.get('docwsid')
+                    new_etag = resp.get('etag')
+                    new_size = resp.get('size')
+                    
+                    if new_cloud_id:
+                        self._update_db_and_shadow(obj, new_cloud_id, new_etag, new_size, target_hash, parent_cloud_id)
+                except Exception as e:
+                    # Handle 412 Conflict (Precondition Failed) - though pre-check should catch most
+                    is_conflict = False
+                    if "412" in str(e) or "Precondition Failed" in str(e): is_conflict = True
+                    elif hasattr(e, '__cause__') and e.__cause__ and ("412" in str(e.__cause__) or "Precondition Failed" in str(e.__cause__)): is_conflict = True
+
+                    if is_conflict:
+                        logger.warning(f"Upload conflict (412) for '{full_name}'. Attempting overwrite...")
+                        try:
+                            # Re-list to be sure
+                            children = self.drive_svc.list_directory(parent_cloud_id)
+                            conflict_item = next((i for i in children if i.get('name') == full_name), None)
+                            
+                            if conflict_item:
+                                c_id = conflict_item.get('docwsid', conflict_item.get('drivewsid'))
+                                c_etag = conflict_item.get('etag')
+                                self.drive_svc.delete_item(c_id, c_etag)
+                                
+                                resp = self.drive_svc.upload_file(symlink_path, parent_cloud_id)
+                                new_cloud_id = resp.get('document_id') or resp.get('docwsid')
+                                new_etag = resp.get('etag')
+                                new_size = resp.get('size')
+                                
+                                if new_cloud_id:
+                                    self._update_db_and_shadow(obj, new_cloud_id, new_etag, new_size, target_hash, parent_cloud_id)
+                            else:
+                                raise e
+                        except Exception as retry_e:
+                            logger.error(f"Failed to resolve conflict for {obj.id}: {retry_e}")
+                            raise e
+                    else:
+                        raise e
 
         elif isinstance(obj, DriveFolder):
             self.drive_svc.create_folder(parent_cloud_id, full_name)
@@ -262,8 +367,22 @@ class SyncEngine:
                  # Fallback to local parent lookup
                  p_row = self.db.fetchone("SELECT cloud_id FROM objects WHERE id=?", (obj.local.parent_id,))
                  if p_row: parent_id = p_row['cloud_id']
-        print("Parent ID:", parent_id)
-        print("Cloud Parent ID:", obj.cloud.parent_id)
+        
+        # Conflict Check: Does target name exist?
+        try:
+            children = self.drive_svc.list_directory(parent_id)
+            conflict_item = next((i for i in children if i.get('name') == target_name), None)
+            
+            if conflict_item:
+                c_id = conflict_item.get('docwsid', conflict_item.get('drivewsid'))
+                c_etag = conflict_item.get('etag')
+                # Check if it is NOT the item we are renaming (just to be safe)
+                if c_id != obj.cloud.id:
+                    logger.info(f"Conflict detected for rename: {target_name} exists (ID: {c_id}). Deleting remote conflict.")
+                    self.drive_svc.delete_item(c_id, c_etag)
+        except Exception as e:
+            logger.warning(f"Error checking conflicts during rename: {e}")
+
         meta = self.drive_svc.get_item_metadata(obj.cloud.id, parent_id=parent_id)
         if not meta: 
             logger.warning(f"Could not find metadata for {obj.id} (CloudID: {obj.cloud.id}, Parent: {parent_id})")
@@ -348,17 +467,24 @@ class SyncEngine:
     def _handle_ensure_latest(self, obj):
         if not obj.cloud.id: return
         
-        parent_cloud_id = obj.cloud.parent_id
-        
-        meta = self.drive_svc.get_item_metadata(obj.cloud.id, parent_id=parent_cloud_id)
-        if not meta: return 
-        
-        cloud_etag = meta.get('etag')
-        
-        if not obj.local.present or obj.cloud.etag != cloud_etag:
-            self._handle_download(obj)
-        else:
-            self._mark_synced(obj)
+        # Optimize: Check if parent folder was synced recently
+        parent = OrchardObject.load(self.db, obj.local.parent_id)
+        if parent:
+            # If parent synced > 30s ago, refresh the folder
+            if (int(time.time()) - parent.last_synced) > 30:
+                 if parent.cloud.id:
+                     self._pull_drive_folder(parent.cloud.id, parent.id)
+            
+            # Reload object state from DB after potential pull
+            updated_obj = OrchardObject.load(self.db, obj.id)
+            if not updated_obj: return 
+            
+            # Check if we need download
+            # If _pull_drive_folder saw a change, it updated ETag and set present_locally=0
+            if not updated_obj.local.present:
+                self._handle_download(updated_obj)
+            else:
+                self._mark_synced(updated_obj)
 
     # ----------------------------------------------------------------
     # HELPERS

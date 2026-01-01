@@ -309,6 +309,7 @@ class iCloudDrive:
                 "drivewsid": drivewsid,
                 "etag": etag,
                 "name": new_name,
+                "clientId": self._params.get("clientId", self._params.get("client_id")),
             }]
         }
 

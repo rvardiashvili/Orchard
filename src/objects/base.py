@@ -47,6 +47,7 @@ class OrchardObject:
         
         self.id = _row_dict.get('id')
         self.type = _row_dict.get('type', 'unknown')
+        self.last_synced = _row_dict.get('last_synced', 0)
         
         # Initialize State Objects
         self.cloud = CloudState(_row_dict)

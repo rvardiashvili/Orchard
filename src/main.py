@@ -5,6 +5,7 @@ import signal
 import sys
 import threading
 import time
+import socket
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parent.parent
@@ -16,6 +17,15 @@ from src.sync.engine import SyncEngine
 from src.fs.orchardFS import mount_daemon
 
 logger = logging.getLogger(__name__)
+
+def check_connection(host="1.1.1.1", port=53, timeout=3):
+    """Check for internet connectivity."""
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except socket.error:
+        return False
 
 def main():
     parser = argparse.ArgumentParser(description="Orchard - Drive Sync Only")
@@ -32,10 +42,15 @@ def main():
 
     # 2. Auth
     client = OrchardiCloudClient(args.apple_id, cookie_directory=args.cookie_dir)
-    client.authenticate()
-    if not client.authenticated:
-        logger.error("Authentication failed.")
-        sys.exit(1)
+    
+    if check_connection():
+        logger.info("Internet connection detected. Authenticating...")
+        client.authenticate()
+        if not client.authenticated:
+            logger.error("Authentication failed. Please check your credentials.")
+            sys.exit(1)
+    else:
+        logger.warning("No internet connection. Starting in OFFLINE Mode.")
 
     # 3. Engine
     engine = SyncEngine(orchard_db, client)

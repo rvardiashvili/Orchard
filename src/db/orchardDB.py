@@ -234,6 +234,15 @@ class OrchardDB:
 
         # --- LOGIC START ---
 
+        # SCENARIO: LIST CHILDREN (Deduplication)
+        # If we already have a pending/processing list_children for this target, we don't need another one.
+        if action_type == 'list_children':
+            for row in pending_actions:
+                if row['action_type'] == 'list_children':
+                    logger.info(f"Skipping duplicate list_children for {target_id}")
+                    return 
+            # If no duplicate found, fall through to enqueue
+
         if action_type == 'delete':
             ids_to_delete = [row['action_id'] for row in pending_actions if row['status'] != 'processing']
             if ids_to_delete:
