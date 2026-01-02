@@ -7,6 +7,7 @@ import uuid
 import shutil
 import tempfile
 import requests
+import concurrent.futures
 
 from src.db.orchardDB import OrchardDB
 from src.icloud_client.icloud_drive import iCloudDrive, CLOUD_DOCS_ZONE_ID_ROOT
@@ -24,12 +25,15 @@ from src.config.sync_config import MAX_RETRIES, BASE_BACKOFF_SECONDS
 
 logger = logging.getLogger(__name__)
 
+CHUNK_SIZE = 8 * 1024 * 1024
+
 class SyncEngine:
     def __init__(self, db: OrchardDB, api_client: OrchardiCloudClient):
         self.db = db
         self.api = api_client
         self.running = False
         self.drive_svc: iCloudDrive = None
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         
         # Initial setup handled in _ensure_service called by start/_loop
 
@@ -40,6 +44,7 @@ class SyncEngine:
 
     def stop(self):
         self.running = False
+        self.executor.shutdown(wait=False)
 
     def _ensure_service(self):
         """Checks if drive service is available; attempts to reconnect if not."""
@@ -88,24 +93,30 @@ class SyncEngine:
 
             task = self._get_next_retryable_action()
             if task:
-                try:
-                    self._process_task(task)
-                    self.db.complete_action(task['action_id'])
-                except Exception as e:
-                    err_str = str(e)
-                    # Network Error Detection
-                    if any(x in err_str for x in ["Connection", "Timeout", "503", "409", "socket", "Client Error"]):
-                        logger.warning(f"Network/Service error executing task {task['action_id']}: {e}. Pausing service for reconnection.")
-                        self.drive_svc = None # Force reconnection logic
-                        # Do NOT fail the action; it stays 'processing' (or we could reset to pending)
-                        # Ideally reset to pending so it's picked up again
-                        self.db.execute("UPDATE actions SET status='pending' WHERE action_id=?", (task['action_id'],))
-                        time.sleep(2) # Backoff slightly
-                    else:
-                        logger.error(f"Task {task['action_type']} (ID: {task['action_id']}) failed: {e}", exc_info=True)
-                        self.db.fail_action(task['action_id'], task['target_id'], str(e))
+                # Dispatch IO tasks to threads, keep Metadata tasks on main thread (priority)
+                if task['action_type'] in ['upload', 'download', 'update_content', 'download_chunk']:
+                    self.executor.submit(self._safe_process_task, task)
+                else:
+                    self._safe_process_task(task)
             else:
-                time.sleep(1)
+                time.sleep(0.1) # Faster polling for responsiveness
+
+    def _safe_process_task(self, task):
+        try:
+            self._process_task(task)
+            self.db.complete_action(task['action_id'])
+        except Exception as e:
+            err_str = str(e)
+            # Network Error Detection
+            if any(x in err_str for x in ["Connection", "Timeout", "503", "409", "socket", "Client Error"]):
+                logger.warning(f"Network/Service error executing task {task['action_id']}: {e}. Pausing service for reconnection.")
+                self.drive_svc = None # Force reconnection logic
+                # Reset to pending so it's picked up again
+                self.db.execute("UPDATE actions SET status='pending' WHERE action_id=?", (task['action_id'],))
+                time.sleep(2) # Backoff slightly
+            else:
+                logger.error(f"Task {task['action_type']} (ID: {task['action_id']}) failed: {e}", exc_info=True)
+                self.db.fail_action(task['action_id'], task['target_id'], str(e))
 
     def _get_next_retryable_action(self):
         now = int(time.time())
@@ -176,12 +187,42 @@ class SyncEngine:
         elif direction == 'pull':
             if action == 'download':
                 self._handle_download(obj)
+            elif action == 'download_chunk':
+                self._handle_download_chunk(obj, metadata)
             elif action == 'ensure_latest':
                 self._handle_ensure_latest(obj)
 
     # ----------------------------------------------------------------
     # HANDLERS
     # ----------------------------------------------------------------
+    
+    def _handle_download_chunk(self, obj, metadata):
+        chunk_idx = metadata['chunk_index']
+        
+        if self.db.has_chunk(obj.id, chunk_idx): return
+
+        start_byte = chunk_idx * CHUNK_SIZE
+        # Ensure we don't go past file size
+        end_byte = min((chunk_idx + 1) * CHUNK_SIZE - 1, obj.local.size - 1)
+        
+        # Guard against zero-byte files or bad math
+        if start_byte >= obj.local.size:
+            logger.warning(f"Chunk {chunk_idx} starts at {start_byte} but file size is {obj.local.size}")
+            return
+
+        data = self.drive_svc.download_file_part(obj.cloud.id, start_byte, end_byte)
+        
+        local_path = obj.get_local_full_path()
+        if not os.path.exists(local_path):
+             with open(local_path, 'wb') as f: f.truncate(obj.local.size)
+
+        with open(local_path, 'r+b') as f:
+            f.seek(start_byte)
+            f.write(data)
+            
+        self.db.add_chunk(obj.id, chunk_idx)
+        # Mark as partially present (2) ONLY if not already full (1)
+        self.db.execute("UPDATE drive_cache SET present_locally=2, last_accessed=? WHERE object_id=? AND present_locally != 1", (int(time.time()), obj.id))
 
     def _pull_drive_folder(self, cloud_id, local_parent_id):
         try:
@@ -217,21 +258,34 @@ class SyncEngine:
                         logger.info(f"File {name} changed on cloud. Marking local cache stale.")
                         self.db.execute("UPDATE drive_cache SET present_locally=0 WHERE object_id=?", (existing['id'],))
 
-                self.db.execute("""
-                    UPDATE objects 
-                    SET etag=?, name=?, extension=?, size=?, type=?, cloud_parent_id=?, last_synced=?, missing_from_cloud=0
-                    WHERE cloud_id=?
-                """, (etag, name, extension, size, item_type, cloud_id, int(time.time()), c_id))
+                # FIX: Do not update last_synced for folders here. 
+                # last_synced on a folder means "when we listed ITS children".
+                # We are only listing the parent here.
+                if item_type == 'folder':
+                     self.db.execute("""
+                        UPDATE objects 
+                        SET etag=?, name=?, extension=?, size=?, type=?, cloud_parent_id=?, missing_from_cloud=0
+                        WHERE cloud_id=?
+                    """, (etag, name, extension, size, item_type, cloud_id, c_id))
+                else:
+                     self.db.execute("""
+                        UPDATE objects 
+                        SET etag=?, name=?, extension=?, size=?, type=?, cloud_parent_id=?, last_synced=?, missing_from_cloud=0
+                        WHERE cloud_id=?
+                    """, (etag, name, extension, size, item_type, cloud_id, int(time.time()), c_id))
                 
                 self.db.update_shadow(existing['id'], cloud_id=c_id, parent_id=local_parent_id, etag=etag, name=name, modified_at=int(time.time()))
             else:
                 new_id = str(uuid.uuid4())
+                # For new folders, last_synced should be 0 (never listed children)
+                initial_last_synced = int(time.time()) if item_type == 'file' else 0
+                
                 self.db.execute("""
                     INSERT INTO objects (id, type, parent_id, name, extension, size, cloud_id, cloud_parent_id, etag, sync_state, last_synced)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     new_id, item_type, local_parent_id, name, extension, size, 
-                    c_id, cloud_id, etag, SYNC_STATE_SYNCHRONIZED, int(time.time())
+                    c_id, cloud_id, etag, SYNC_STATE_SYNCHRONIZED, initial_last_synced
                 ))
                 self.db.update_shadow(new_id, cloud_id=c_id, parent_id=local_parent_id, name=name, etag=etag, modified_at=int(time.time()))
 
@@ -239,9 +293,32 @@ class SyncEngine:
         target_name = metadata.get('name', obj.local.name)
         target_hash = metadata.get('file_hash')
 
+        # --- STABILITY CHECK START ---
+        if isinstance(obj, DriveFile):
+            # 1. Check Open Count
+            cache = self.db.fetchone("SELECT open_count FROM drive_cache WHERE object_id=?", (obj.id,))
+            if cache and cache['open_count'] > 0:
+                logger.info(f"Deferring upload for {obj.id}: File is open (count={cache['open_count']})")
+                raise Exception("File is open for writing (Stability Check)")
+
+            # 2. Check Size Stability
+            try:
+                path = obj.get_local_full_path()
+                size_t0 = os.path.getsize(path)
+                time.sleep(2.0) # Wait for potential writes
+                size_t1 = os.path.getsize(path)
+                
+                if size_t0 != size_t1:
+                    logger.info(f"Deferring upload for {obj.id}: File is growing ({size_t0} -> {size_t1})")
+                    raise Exception("File is growing (Stability Check)")
+            except FileNotFoundError:
+                pass # Will be caught later
+        # --- STABILITY CHECK END ---
+
         shadow = self.db.get_shadow(obj.id)
         if shadow and target_hash and shadow['file_hash'] == target_hash:
             logger.info(f"Skipping upload for {obj.id}: Shadow hash matches intent.")
+            self._mark_synced(obj)
             return
 
         # Resolve Parent Cloud ID
@@ -329,6 +406,23 @@ class SyncEngine:
             self._mark_synced(obj)
 
     def _handle_update_content(self, obj, metadata):
+        # Apply Stability Check here as well
+        if isinstance(obj, DriveFile):
+            cache = self.db.fetchone("SELECT open_count FROM drive_cache WHERE object_id=?", (obj.id,))
+            if cache and cache['open_count'] > 0:
+                logger.info(f"Deferring update for {obj.id}: File is open")
+                raise Exception("File is open (Stability Check)")
+            
+            try:
+                path = obj.get_local_full_path()
+                size_t0 = os.path.getsize(path)
+                time.sleep(2.0)
+                size_t1 = os.path.getsize(path)
+                if size_t0 != size_t1:
+                    logger.info(f"Deferring update for {obj.id}: File is growing")
+                    raise Exception("File is growing (Stability Check)")
+            except: pass
+
         if not obj.cloud.id: return self._handle_upload(obj, metadata)
         
         target_hash = metadata.get('file_hash')
@@ -481,7 +575,8 @@ class SyncEngine:
             
             # Check if we need download
             # If _pull_drive_folder saw a change, it updated ETag and set present_locally=0
-            if not updated_obj.local.present:
+            # Also download if Partial (2) to Ensure Latest/Full
+            if updated_obj.local.present != 1:
                 self._handle_download(updated_obj)
             else:
                 self._mark_synced(updated_obj)

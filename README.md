@@ -21,6 +21,7 @@ Orchard is a robust FUSE-based synchronization engine that creates a seamless br
 -   **Optimistic I/O**: Filesystem operations return *immediately*. The sync engine handles the network in the background, now with **optimized action queueing and coalescing** for greater efficiency.
 -   **Smart Caching**: Files appear instantly, but content is downloaded only when you specifically read it.
 -   **Thumbnail Blocking**: Intelligent filters prevent file managers from downloading your entire drive just to generate icons.
+-   **Offline Mode**: Works seamlessly without internet. Browse cached files, make edits, and sync automatically when connectivity is restored.
 -   **Robust Conflict Resolution**: Improved handling of version conflicts and network race conditions using a **"Shadow State" mechanism** and **exponential backoff for retries**.
 
 ---

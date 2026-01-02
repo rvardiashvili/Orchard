@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Free Up Space
+Comment=Remove local content to save space
+Exec=setfattr -n user.orchard.pinned -v 0 %F
+Icon-Name=drive-cloud
+Selection=Any
+Extensions=any;
+Quote=double

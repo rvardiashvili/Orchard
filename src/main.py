@@ -56,13 +56,29 @@ def main():
     engine = SyncEngine(orchard_db, client)
     threading.Thread(target=engine.start, daemon=True).start()
 
-    # 4. FUSE
+    # 4. FUSE (Thread)
     if not os.path.exists(args.mount_point): os.makedirs(args.mount_point)
-    
     logger.info(f"Mounting {args.mount_point}...")
+    
+    fuse_thread = threading.Thread(target=mount_daemon, args=(args.db_path, args.mount_point))
+    fuse_thread.daemon = True
+    fuse_thread.start()
+
+    # 5. GUI / Main Loop
     try:
-        mount_daemon(args.db_path, args.mount_point)
-    except KeyboardInterrupt:
+        from src.gui.tray import OrchardTray
+        logger.info("Starting System Tray Icon...")
+        tray = OrchardTray(engine, args.mount_point)
+        # Enable Ctrl+C support for Gtk
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        tray.run()
+    except (ImportError, ValueError) as e:
+        logger.warning(f"GUI Unavailable ({e}). Running in Headless Mode.")
+        try:
+            while True: time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    finally:
         logger.info("Stopping...")
         engine.stop()
         os.system(f"fusermount -u {args.mount_point}")

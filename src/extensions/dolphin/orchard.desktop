@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/all;
+Actions=pin;unpin;
+X-KDE-Submenu=Orchard
+
+[Desktop Action pin]
+Name=Make Available Offline
+Icon=drive-harddisk
+Exec=setfattr -n user.orchard.pinned -v 1 %f
+
+[Desktop Action unpin]
+Name=Free Up Space
+Icon=drive-cloud
+Exec=setfattr -n user.orchard.pinned -v 0 %f

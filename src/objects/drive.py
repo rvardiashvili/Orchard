@@ -102,12 +102,12 @@ class DriveFile(DriveObject):
             f.seek(offset)
             f.write(data)
         
-        self.size = os.path.getsize(path)
+        # Optimization: Don't commit to DB on every write.
+        # Just update in-memory state. Commit happens on release().
+        self.local.size = os.path.getsize(path)
         self.present_locally = 1
         self.dirty = 1
         self.local_modified_at = int(time.time())
-        self.update_cache_entry()
-        self.commit()
         return len(data)
 
     def create_local_placeholder(self):
@@ -115,6 +115,13 @@ class DriveFile(DriveObject):
         with open(path, 'wb') as f:
             pass
         self.present_locally = 1
+        self.update_cache_entry()
+
+    def create_sparse_placeholder(self):
+        path = self.get_local_full_path()
+        with open(path, 'wb') as f:
+            f.truncate(self.local.size)
+        self.present_locally = 2
         self.update_cache_entry()
 
     def _calculate_file_hash(self, file_path):

@@ -217,9 +217,7 @@ class iCloudDrive:
             LOGGER.error(f"Error listing trash: {e}")
             raise
 
-    def download_file(self, file_id: str, zone: str = CLOUD_DOCS_ZONE, local_path: Optional[str] = None) -> str:
-        LOGGER.info(f"Attempting to download file with ID: {file_id}")
-
+    def _get_download_url(self, file_id: str, zone: str = CLOUD_DOCS_ZONE) -> str:
         document_id = file_id
         if "::" in file_id:
             document_id = file_id.split("::")[-1]
@@ -227,7 +225,6 @@ class iCloudDrive:
         file_params = dict(self._params)
         file_params.update({"document_id": document_id})
 
-        # Step 1: Get the download URL
         try:
             response = self._session.get(
                 f"{self._document_root}/ws/{zone}/download/by_id",
@@ -246,11 +243,16 @@ class iCloudDrive:
         
         if not download_url:
             raise Exception(f"Could not find download URL for file {file_id}")
+        
+        return download_url
+
+    def download_file(self, file_id: str, zone: str = CLOUD_DOCS_ZONE, local_path: Optional[str] = None) -> str:
+        LOGGER.info(f"Attempting to download file with ID: {file_id}")
+        
+        download_url = self._get_download_url(file_id, zone)
 
         # Determine filename and local path
         if local_path is None:
-            # Fallback logic since we might not know parent_id here in CLI usage
-            # But if SyncEngine calls this, it usually provides local_path derived from DB.
             filename_from_url = os.path.basename(download_url.split('?')[0].split('%3F')[0])
             local_path = filename_from_url
             LOGGER.warning("Using URL filename because parent_id for metadata fetch is unknown in this context.")
@@ -272,6 +274,18 @@ class iCloudDrive:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             raise Exception(f"Failed to save downloaded file {file_id}") from e
+
+    def download_file_part(self, file_id: str, start_byte: int, end_byte: int, zone: str = CLOUD_DOCS_ZONE) -> bytes:
+        """Downloads a specific byte range of a file."""
+        # LOGGER.debug(f"Downloading part {start_byte}-{end_byte} for {file_id}") # verbose
+        download_url = self._get_download_url(file_id, zone)
+        
+        headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+        
+        response = self._session.get(download_url, headers=headers, stream=True)
+        self._raise_if_error(response)
+        
+        return response.content
 
     def download_directory(self, folder_id: str, local_path: str):
         full_folder_id = self._ensure_prefix(folder_id, "FOLDER")
@@ -437,6 +451,7 @@ class iCloudDrive:
                     upload_url, 
                     files=files_payload,
                     headers=headers,
+                    cookies=self._session.cookies,
                     timeout=300
                 )
                 

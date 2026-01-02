@@ -125,12 +125,17 @@ The `actions` table functions as a persistent, prioritized task queue. The Sync 
 *   **Coalescing**: Sequential, redundant actions on the same object are merged. For example, multiple renames of the same file before it's synced will result in a single `rename` action with the final target name. This prevents unnecessary network calls.
 *   **Retry with Exponential Backoff**: Failed actions are automatically retried with an increasing delay, preventing network congestion and gracefully handling transient errors.
 
-### Robust Conflict Resolution with Shadow State
-When a local change conflicts with a remote change (e.g., both edited a file, or a file was deleted remotely but edited locally):
-1.  Orchard utilizes the `shadows` table to store a snapshot of the object's cloud metadata before a local modification or after the last known good sync.
-2.  When attempting an `upload` or `update_content`, if the cloud's current `etag` does not match the `shadows` `etag` (or the last known `etag` from the `objects` table), a conflict is detected.
-3.  For many actions (e.g., `upload`, `update_content`), Orchard prioritizes **Local Wins**: it attempts to delete the conflicting remote item (using its cloud ID and current `etag` to ensure it's deleting the correct version) and then re-uploads the local version. This ensures user-initiated changes are preserved.
-4.  More complex conflict scenarios lead to a `sync_state = 'conflict'` and require manual resolution or specific user actions.
+### Sync Engine Loop & Connectivity
+The Sync Engine runs an infinite loop that:
+1.  **Checks Connectivity**: Before processing tasks, it verifies internet access and authentication. If offline, it pauses and retries periodically.
+2.  **Processes Queue**: It fetches the next pending `action` from the database.
+3.  **Handles Errors**: Network errors trigger a pause and backoff. Fatal errors mark the action as failed.
+
+### Robust Conflict Resolution (Local Wins)
+Orchard enforces a "Local Wins" strategy for file conflicts to prioritize user data:
+1.  **Uploads**: Before uploading a new file, the engine checks if a file with the same name already exists on the cloud. If so, it **deletes the remote file** before uploading the local version.
+2.  **Renames**: Similar to uploads, if a rename target exists remotely, the remote item is deleted first.
+3.  **Concurrency**: The system uses `shadows` and ETags to detect if the cloud state has drifted, but for direct naming collisions, the local intent overrides the remote state.
 
 ### Atomic Writes
 1.  **Uploads**: We create a symlink in a temporary directory to ensure the upload has the correct filename without moving the actual cache file.

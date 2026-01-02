@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Make Available Offline
+Comment=Download and keep this file on disk
+Exec=setfattr -n user.orchard.pinned -v 1 %F
+Icon-Name=drive-harddisk
+Selection=Any
+Extensions=any;
+Quote=double

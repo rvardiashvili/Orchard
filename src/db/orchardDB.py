@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS actions (
 CREATE INDEX IF NOT EXISTS idx_parent ON objects(parent_id);
 CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);
 CREATE INDEX IF NOT EXISTS idx_actions_target ON actions(target_id);
+
+CREATE TABLE IF NOT EXISTS chunk_cache (
+    object_id TEXT,
+    chunk_index INTEGER,
+    last_accessed INTEGER,
+    PRIMARY KEY (object_id, chunk_index),
+    FOREIGN KEY(object_id) REFERENCES objects(id) ON DELETE CASCADE
+);
 """
 
 class OrchardDB:
@@ -117,6 +125,23 @@ class OrchardDB:
                         time.sleep(0.5)
                         continue
                 raise e
+
+    def add_chunk(self, object_id, chunk_index):
+        """Marks a specific chunk as present locally."""
+        self.execute("""
+            INSERT OR REPLACE INTO chunk_cache (object_id, chunk_index, last_accessed)
+            VALUES (?, ?, ?)
+        """, (object_id, chunk_index, int(time.time())))
+
+    def has_chunk(self, object_id, chunk_index):
+        """Checks if a specific chunk is present."""
+        row = self.fetchone("SELECT 1 FROM chunk_cache WHERE object_id=? AND chunk_index=?", (object_id, chunk_index))
+        return bool(row)
+    
+    def get_present_chunks(self, object_id):
+        """Returns a set of all present chunk indices for an object."""
+        rows = self.fetchall("SELECT chunk_index FROM chunk_cache WHERE object_id=?", (object_id,))
+        return {r['chunk_index'] for r in rows}
 
     def get_conn(self):
         if not hasattr(self.local_thread, 'conn'):

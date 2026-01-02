@@ -9,10 +9,12 @@
 - [x] **Upload Conflict Handling**: Robustly handle `412` errors by identifying and overwriting conflicting remote files.
 - [x] **Metadata Sync**: Immediate DB update after upload to prevent "delete-and-reupload" loops.
 - [x] **Action Deduplication**: Prevent `write()` from flooding the queue with redundant `update_content` tasks.
+- [x] **Offline Mode**: Start without internet, auto-reconnect, and sync when online.
+- [x] **Conflict Resolution**: "Local Wins" strategy for uploads and renames (delete remote conflict).
+- [x] **Error Recovery**: Network error detection, pause/resume service, and exponential backoff.
 
 ## In Progress
 - [ ] **Partial Sync**: Support range requests for large files (currently downloads full file).
-- [ ] **Error Recovery**: Better backoff strategies for network failures.
 
 ## Future Roadmap
 
