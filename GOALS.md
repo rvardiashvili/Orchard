@@ -12,8 +12,37 @@
 - [x] **Offline Mode**: Start without internet, auto-reconnect, and sync when online.
 - [x] **Conflict Resolution**: "Local Wins" strategy for uploads and renames (delete remote conflict).
 - [x] **Error Recovery**: Network error detection, pause/resume service, and exponential backoff.
+- [x] **Partial Sync / Streaming**: Hybrid strategy (Full download < 32MB, Sparse Chunked > 32MB) for instant access to large files.
+- [x] **Desktop Integration**:
+    - Context Menus ("Make Available Offline", "Free Up Space") for Nautilus, Nemo, Dolphin, Thunar.
+    - Custom Emblems (Local, Cloud, Partial, Modified) for visual status.
+    - Nautilus Status Column.
+- [x] **System & UI**:
+    - System Tray Icon with status indicators (Online/Offline/Syncing).
+    - Control Panel Application (GTK3) for status overview and manual conflict resolution.
+    - Setup Wizard for easy first-time configuration.
+    - Autostart integration (.desktop file).
+- [x] **Performance**: Multi-threaded Sync Engine (IO threads + Metadata thread).
+- [x] **App Polishing**: Custom icons, About dialog, and refined UI.
 
 ## In Progress
+- [ ] **Shared Folders**: Support for iCloud shared directories.
+
+## Future Roadmap
+
+### Phase 1 (Core Ecosystem)
+- [ ] **Notes**: Bi-directional sync using virtual markdown files (`.orchard-note`).
+- [ ] **Reminders**: Structured task lists synced as virtual files.
+- [ ] **Contacts**: Read-only integration (vCard export/sync).
+- [ ] **Calendar**: Read-only integration (iCal events).
+
+### Phase 2 (Extended Media)
+- [ ] **Photos**: Metadata-only sync initially, with on-demand download.
+- [ ] **Mail**: (Feasibility study required).
+
+### Phase 3 (Advanced)
+- [ ] **Selective Sync**: Allow users to pin/unpin specific folders (Folder-level pinning).
+- [ ] **Cross-Device Features**: Clipboard sync, AirDrop-style transfer (investigation needed).
 - [ ] **Partial Sync**: Support range requests for large files (currently downloads full file).
 
 ## Future Roadmap

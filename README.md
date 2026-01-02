@@ -16,36 +16,51 @@ Orchard is a robust FUSE-based synchronization engine that creates a seamless br
 
 ## ✨ Key Features
 
--   **Enhanced State Management**: Introduces `LocalState` and `CloudState` for explicit separation and management of local and cloud object metadata, improving clarity and maintainability.
+-   **System Tray & Control Panel**: Monitor sync status, view errors, and resolve file conflicts via a modern GUI dashboard.
+-   **Partial Sync & Streaming**: Open large files (movies, archives) instantly. Orchard downloads only the required 8MB chunks on-demand.
+-   **Desktop Integration**: 
+    -   **Context Menus**: "Make Available Offline" and "Free Up Space" in Nautilus, Nemo, Dolphin, and Thunar.
+    -   **Visual Status**: Custom emblems (Green Check, Cloud, Syncing) on files.
+    -   **Native Experience**: Setup Wizard for easy configuration and Autostart support.
+-   **Enhanced State Management**: Introduces `LocalState` and `CloudState` for explicit separation and management of local and cloud object metadata.
 -   **Bi-directional Sync**: Changes made locally are pushed to iCloud, and remote changes are pulled down.
--   **Optimistic I/O**: Filesystem operations return *immediately*. The sync engine handles the network in the background, now with **optimized action queueing and coalescing** for greater efficiency.
--   **Smart Caching**: Files appear instantly, but content is downloaded only when you specifically read it.
--   **Thumbnail Blocking**: Intelligent filters prevent file managers from downloading your entire drive just to generate icons.
+-   **Optimistic I/O**: Filesystem operations return *immediately*. The sync engine handles the network in the background with multi-threaded performance.
 -   **Offline Mode**: Works seamlessly without internet. Browse cached files, make edits, and sync automatically when connectivity is restored.
--   **Robust Conflict Resolution**: Improved handling of version conflicts and network race conditions using a **"Shadow State" mechanism** and **exponential backoff for retries**.
+-   **Robust Conflict Resolution**: "Local Wins" strategy protects your work. Manual conflict resolver tool available in Control Panel.
 
 ---
 
 ## 🚀 Usage
 
-### Requirements
--   Python 3.11+
--   `fusepy`
--   `pyicloud`
-
 ### Quick Start
+Orchard provides an automated installer to set up dependencies, the virtual environment, and desktop integration.
+
 ```bash
-# Clone the repository
+# 1. Clone the repository
 git clone https://github.com/rvardiashvili/orchard.git
 cd orchard
 
-# Setup environment
-python -m venv .venv
+# 2. Run the Installer
+./install.sh
+
+# 3. Start Orchard
+# Launch "Orchard" from your applications menu, or run:
+./src/main.py
+```
+
+### Manual Setup
+If you prefer manual control:
+```bash
+# Setup environment (Use --system-site-packages for GUI support)
+python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Start the engine
-python main.py
+# Install Desktop Extensions (Menus & Icons)
+python tools/install_extensions.py
+
+# Start the engine (GUI + FUSE)
+python src/main.py
 ```
 
 ---

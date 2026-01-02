@@ -54,41 +54,41 @@ class OrchardiCloudClient:
         except Exception as e:
             LOGGER.error(f"Failed to save password to keyring: {e}")
 
-    def authenticate(self):
+    def authenticate(self, input_callback=None):
         """
         Authenticates with iCloud using pyicloud.
-        Handles 2FA/2SA prompts.
+        Handles 2FA/2SA prompts via CLI or optional callback.
+        input_callback(type, message, options=None) -> str
+        types: 'password', '2fa_code', 'device_select'
         """
         # Prompt for password if not available from init or keyring
         if self.password is None:
-            self.password = getpass.getpass(f"Enter password for {self.apple_id}: ")
+            if input_callback:
+                self.password = input_callback("password", f"Enter password for {self.apple_id}")
+            else:
+                self.password = getpass.getpass(f"Enter password for {self.apple_id}: ")
+            
             self._password_provided_by_user = True
-            if not self.password: # User might just press Enter
+            if not self.password: 
                 LOGGER.error("Password cannot be empty.")
                 self.authenticated = False
                 return
 
         try:
-            # Initialize PyiCloudService. This might succeed even if 2FA is required,
-            # as it internally sets flags like requires_2fa.
+            # Initialize PyiCloudService. 
             self._pyicloud_service = PyiCloudService(
                 self.apple_id,
                 self.password,
                 cookie_directory=self.cookie_directory,
             )
             
-            # Check for 2FA/2SA *after* initialization
-            # Use requires_2sa here, as requires_trusted_device_verification is not a direct attribute
             if self._pyicloud_service.requires_2fa or self._pyicloud_service.requires_2sa:
                 LOGGER.warning("Two-Factor/Two-Step Authentication required.")
-                self._handle_2fa() # This will set self.authenticated if successful
+                self._handle_2fa(input_callback) 
             else:
-                # If no 2FA/2SA needed, then authentication is complete
                 self.authenticated = True
                 LOGGER.info(f"Successfully authenticated as {self.apple_id}")
 
-            # Save password to keyring if it was provided by user during this session
-            # and authentication was successful (including 2FA/2SA)
             if self.authenticated and self._password_provided_by_user:
                 self._save_password_to_keyring(self.password)
         except PyiCloudAuthRequiredException as e:
@@ -96,8 +96,7 @@ class OrchardiCloudClient:
             self.authenticated = False
         except PyiCloudFailedLoginException:
             LOGGER.error("Failed to login to iCloud. Please check your credentials.")
-            # Clear password from keyring on failed login if it was used/provided
-            if self.password and not self._password_provided_by_user: # Only if fetched from keyring
+            if self.password and not self._password_provided_by_user: 
                  try:
                      keyring.delete_password(KEYRING_SERVICE_NAME, self.apple_id)
                      LOGGER.info("Password removed from keyring due to failed login.")
@@ -108,7 +107,7 @@ class OrchardiCloudClient:
             LOGGER.error(f"An unexpected error occurred during authentication: {e}")
             self.authenticated = False
 
-    def _handle_2fa(self):
+    def _handle_2fa(self, input_callback=None):
         """
         Handles the 2FA process by prompting the user for a code.
         """
@@ -117,9 +116,14 @@ class OrchardiCloudClient:
             self.authenticated = False
             return
 
-        if self._pyicloud_service.requires_2fa: # This handles modern 2FA (6-digit code)
-            print("Two-factor authentication required.")
-            code = input("Enter the 6-digit code sent to your trusted device: ")
+        if self._pyicloud_service.requires_2fa: 
+            msg = "Two-factor authentication required. Enter the 6-digit code sent to your trusted device."
+            if input_callback:
+                code = input_callback("2fa_code", msg)
+            else:
+                print(msg)
+                code = input("Code: ")
+            
             try:
                 result = self._pyicloud_service.validate_2fa_code(code)
                 if result:
@@ -131,17 +135,39 @@ class OrchardiCloudClient:
             except Exception as e:
                 LOGGER.error(f"Error during 2FA validation: {e}")
                 self.authenticated = False
-        elif self._pyicloud_service.requires_2sa: # This handles older 2SA or trusted device verification
+        elif self._pyicloud_service.requires_2sa: 
             print("Two-step verification required.")
             devices = self._pyicloud_service.trusted_devices
-            for i, device in enumerate(devices):
-                print(f"  {i}: {device.get('deviceName', 'Unknown Device')} ({device.get('osVersion', 'Unknown OS')})")
+            
+            if input_callback:
+                # pass list of devices to GUI
+                # options format: list of (index, label)
+                options = [(i, f"{d.get('deviceName', 'Unknown')} ({d.get('osVersion', '?')})") for i, d in enumerate(devices)]
+                selection = input_callback("device_select", "Choose a device to verify", options=options)
+                try:
+                    device_num = int(selection)
+                except:
+                    LOGGER.error("Invalid selection")
+                    self.authenticated = False
+                    return
+            else:
+                for i, device in enumerate(devices):
+                    print(f"  {i}: {device.get('deviceName', 'Unknown Device')} ({device.get('osVersion', 'Unknown OS')})")
+                try:
+                    device_num = int(input("Please choose a device to send the verification code to: "))
+                except:
+                    return
+
             try:
-                device_num = int(input("Please choose a device to send the verification code to: "))
                 device = devices[device_num]
                 result = self._pyicloud_service.send_verification_code(device)
                 if result:
-                    code = input("Please enter validation code: ")
+                    msg = "Please enter validation code:"
+                    if input_callback:
+                        code = input_callback("2fa_code", msg)
+                    else:
+                        code = input(msg + " ")
+                        
                     validation_result = self._pyicloud_service.validate_verification_code(device, code)
                     if validation_result:
                         self.authenticated = True
@@ -152,13 +178,10 @@ class OrchardiCloudClient:
                 else:
                     LOGGER.error("Failed to send verification code.")
                     self.authenticated = False
-            except (ValueError, IndexError):
-                LOGGER.error("Invalid device selection.")
-                self.authenticated = False
             except Exception as e:
                 LOGGER.error(f"Error during trusted device verification: {e}")
                 self.authenticated = False
-        else: # Fallback if neither is true but still not authenticated
+        else: 
             LOGGER.error("Authentication requires further interaction not handled by simple 2FA/2SA checks.")
             self.authenticated = False
 

@@ -86,38 +86,54 @@ Specific cache metadata for iCloud Drive objects, managing local file presence a
 | `local_path` | TEXT | The full path to the locally cached file/folder. |
 | `size` | INTEGER | Size of the locally cached file. |
 | `file_hash` | TEXT | SHA256 hash of the local file content. |
-| `present_locally` | INTEGER | Flag (0/1) if the file content is present on disk. |
+| `present_locally` | INTEGER | `0`: Missing (Cloud), `1`: Full, `2`: Partial (Sparse). |
 | `pinned` | INTEGER | Flag (0/1) if the file is explicitly pinned for local retention. |
 | `last_accessed` | INTEGER | Unix timestamp of the last local access. |
 | `open_count` | INTEGER | Number of current open handles to the local file. |
 
-### `actions` Table
-A persistent, prioritized task queue for the Sync Engine. Actions can be coalesced and retried with exponential backoff.
+### `chunk_cache` Table
+Tracks downloaded 8MB chunks for large files (Sparse Caching).
 
 | Column | Type | Description |
 | :--- | :--- | :--- |
-| `action_id` | INTEGER | Unique auto-incrementing ID for the action. |
-| `action_type` | TEXT | Type of operation: `upload`, `download`, `move`, `rename`, `delete`, `update_content`, `list_children`, `ensure_latest`. |
-| `target_id` | TEXT | The local object ID (from `objects` table) the action pertains to. |
-| `destination` | TEXT | For `move`/`rename`, the new parent ID or new name. |
-| `metadata` | TEXT | JSON string containing additional context for the action (e.g., original parent ID for moves, new name for renames, file hash for uploads). |
-| `direction` | TEXT | `push` (local to cloud) or `pull` (cloud to local). |
-| `priority` | INTEGER | Higher values run first (e.g., FUSE-triggered actions get higher priority). |
-| `created_at` | INTEGER | Unix timestamp when the action was enqueued. |
-| `status` | TEXT | Current status: `pending`, `processing`, `failed`, `completed`. |
-| `retry_count` | INTEGER | Number of times a failed action has been retried. |
-| `last_error` | TEXT | Last error message if the action failed. |
+| `object_id` | TEXT | Foreign key to the `objects` table. |
+| `chunk_index` | INTEGER | Index of the 8MB block (0, 1, 2...). |
+| `last_accessed` | INTEGER | Timestamp for potential LRU eviction of chunks. |
+
+### `actions` Table
+A persistent, prioritized task queue for the Sync Engine. Actions can be coalesced and retried with exponential backoff.
 
 ## 4. Synchronization Logic
 
-The Sync Engine operates asynchronously, driven by the `actions` queue, to reconcile local filesystem state with the remote iCloud state. It employs several strategies to ensure robustness and efficiency.
+### Multi-Threaded Sync Engine
+The Sync Engine (`src/sync/engine.py`) uses a `ThreadPoolExecutor` to handle IO-heavy tasks (`upload`, `download`, `download_chunk`) asynchronously on worker threads. Metadata tasks (`list_children`, `rename`) run on the main thread to ensure high priority and responsiveness.
+
+### Partial Sync & Streaming (Sparse Caching)
+For large files (> 32MB), Orchard uses a "Sparse Caching" strategy:
+1.  **On Open**: A sparse placeholder is created (takes 0 disk space).
+2.  **On Read**: If the requested byte range is missing, FUSE blocks and queues a `download_chunk` action.
+3.  **Engine**: Downloads only the requested 8MB chunk and writes it to the sparse file.
+4.  **Result**: Instant playback for movies/media without waiting for full download.
+
+### Desktop Integration
+Orchard integrates deeply with Linux desktop environments via:
+*   **Extensions**: Python scripts (Nautilus/Nemo) and Action/Desktop files (Dolphin/Thunar) provide context menus ("Make Available Offline").
+*   **Extended Attributes (`xattr`)**: `OrchardFS` exposes status via `user.orchard.status` and `user.xdg.emblems`.
+*   **Custom Emblems**: SVG icons (`vcs-normal`, `vcs-branch`, etc.) installed to `hicolor` theme provide visual status indicators (Local, Cloud, Partial, Modified) across all file managers.
+
+### GUI Architecture
+*   **Tray Icon**: `src/gui/tray.py` runs a GTK3 AppIndicator loop in the main thread. It polls the Sync Engine for status.
+*   **Control Panel**: `src/gui/window.py` provides a dashboard for conflict resolution and settings.
+*   **Setup Wizard**: `src/gui/wizard.py` handles first-run configuration (Apple ID, Mount Point) and authentication.
+*   **Process Model**: Single process. `Main Thread` runs GUI. `Daemon Threads` run FUSE and Sync Engine.
+
+### Configuration & Deployment
+*   **Config Manager**: `src/config/manager.py` handles persistent settings in `~/.config/orchard/config.json`.
+*   **Installation**: `install.sh` automates dependency installation, virtual environment creation, and desktop shortcut generation (`~/.local/share/applications/orchard.desktop`).
 
 ### The "Lazy Open" Strategy
 To prevent file managers (Nautilus, Dolphin) from freezing the UI:
-1.  `open()` calls return a file handle **immediately**.
-2.  If the file is not cached, we do **not** block.
-3.  We only block during the `read()` syscall, and only if the content is missing.
-4.  We check the calling process PID. Known thumbnailers (`ffmpeg`, `nautilus-thumbnailer`) are **denied** download access to save bandwidth.
+1.  `open()` returns immediately.
 
 ### Action Queueing and Coalescing
 The `actions` table functions as a persistent, prioritized task queue. The Sync Engine optimizes operations by:

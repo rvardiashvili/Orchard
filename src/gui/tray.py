@@ -4,6 +4,7 @@ import time
 import webbrowser
 import os
 import signal
+from pathlib import Path
 
 try:
     gi.require_version('Gtk', '3.0')
@@ -22,11 +23,17 @@ class OrchardTray:
         self.app_id = "orchard-sync"
         self.window = None
         
-        # Paths
-        self.icon_path = os.path.abspath("src/assets/icons/orchard-logo.svg")
+        # Set App Name for Tooltip/Menu
+        GLib.set_prgname("Orchard")
+        GLib.set_application_name("Orchard")
+        
+        # Resolve icon path
+        base_path = Path(__file__).parent.parent.parent.resolve()
+        self.icon_base = base_path / "src/assets/icons"
+        self.icon_path = str(self.icon_base / "orchard-logo.svg")
+        
         if not os.path.exists(self.icon_path):
-            # Fallback to system icon or generic
-            self.icon_path = "folder-remote" 
+            self.icon_path = "orchard-logo" # Fallback to installed name
 
         self.indicator = AppIndicator3.Indicator.new(
             self.app_id,
@@ -34,6 +41,7 @@ class OrchardTray:
             AppIndicator3.IndicatorCategory.APPLICATION_STATUS
         )
         self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("Orchard") # Some DEs use this
         
         self.menu = Gtk.Menu()
         self._build_menu()
@@ -78,39 +86,44 @@ class OrchardTray:
 
     def _update_status(self):
         # Poll DB or Engine for status
-        # Ideally engine exposes a quick property
         
-        current_icon = "orchard-logo"
+        icon_name = "orchard-logo"
         
-        # We can query the DB directly for pending actions count
         try:
             # Check Offline
             if not self.engine.drive_svc:
                 self.status_item.set_label("Status: Offline (Connecting...)")
-                self.indicator.set_icon("orchard-logo-offline")
-                return True
-
-            pending = self.engine.db.fetchone("SELECT COUNT(*) as c FROM actions WHERE status IN ('pending', 'processing')")
-            count = pending['c'] if pending else 0
-            
-            failed = self.engine.db.fetchone("SELECT COUNT(*) as c FROM actions WHERE status='failed'")
-            fail_count = failed['c'] if failed else 0
-            
-            if fail_count > 0:
-                self.status_item.set_label(f"Status: {fail_count} Errors")
-                current_icon = "orchard-logo-error"
-            elif count > 0:
-                self.status_item.set_label(f"Status: Syncing ({count} items)...")
-                current_icon = "orchard-logo-sync"
+                icon_name = "orchard-logo-offline"
             else:
-                self.status_item.set_label("Status: Idle (Synced)")
-                current_icon = "orchard-logo"
+                pending = self.engine.db.fetchone("SELECT COUNT(*) as c FROM actions WHERE status IN ('pending', 'processing')")
+                count = pending['c'] if pending else 0
                 
-            self.indicator.set_icon(current_icon)
+                failed = self.engine.db.fetchone("SELECT COUNT(*) as c FROM actions WHERE status='failed'")
+                fail_count = failed['c'] if failed else 0
+                
+                if fail_count > 0:
+                    self.status_item.set_label(f"Status: {fail_count} Errors")
+                    icon_name = "orchard-logo-error"
+                elif count > 0:
+                    self.status_item.set_label(f"Status: Syncing ({count} items)...")
+                    icon_name = "orchard-logo-sync"
+                else:
+                    self.status_item.set_label("Status: Idle (Synced)")
+                    icon_name = "orchard-logo"
+            
+            # Resolve to path if possible
+            if self.icon_base:
+                path = self.icon_base / f"{icon_name}.svg"
+                if path.exists():
+                    self.indicator.set_icon(str(path))
+                else:
+                    self.indicator.set_icon(icon_name)
+            else:
+                self.indicator.set_icon(icon_name)
                 
         except Exception as e:
             self.status_item.set_label("Status: Database Error")
-            self.indicator.set_icon("orchard-logo-error")
+            # self.indicator.set_icon("orchard-logo-error") # Skip to avoid loop
             print(f"Tray Update Error: {e}")
 
         return True # Keep polling
