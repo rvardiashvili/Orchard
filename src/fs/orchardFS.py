@@ -5,6 +5,7 @@ import stat
 import time
 import hashlib
 import json
+import subprocess
 import fuse 
 from fuse import FUSE, FuseOSError, Operations
 
@@ -31,10 +32,10 @@ class OrchardFS(Operations):
     def __init__(self, db_path: str):
         self.db: OrchardDB = get_db(db_path)
         # Initialize root mapping
-        self.path_to_id = {'/': 'root', '/Drive': 'drive_root'} 
-        self.id_to_path = {'root': '/', 'drive_root': '/Drive'}
+        self.path_to_id = {'/': 'root', '/Drive': 'drive_root', '/Photos': 'photos_root'} 
+        self.id_to_path = {'root': '/', 'drive_root': '/Drive', 'photos_root': '/Photos'}
         self.handle_map = {} # fd -> object_id
-        self.fd = 0 
+        self.fd = 1000000 # Start high to avoid collision with OS FDs
         logger.info(f"OrchardFS initialized. DB: {db_path}")
         os.makedirs(ORCHARD_CACHE_DIR, exist_ok=True)
         
@@ -84,10 +85,14 @@ class OrchardFS(Operations):
         parts = [p for p in path.strip('/').split('/') if p]
         if not parts: return OrchardObject.load(self.db, 'root')
 
-        # Start at root
+        # Determine Root
         if parts[0] == 'Drive':
             current_obj = OrchardObject.load(self.db, 'drive_root')
             current_path = '/Drive'
+            start_idx = 1
+        elif parts[0] == 'Photos':
+            current_obj = OrchardObject.load(self.db, 'photos_root')
+            current_path = '/Photos'
             start_idx = 1
         else:
             current_obj = OrchardObject.load(self.db, 'root')
@@ -115,7 +120,7 @@ class OrchardFS(Operations):
             """, (current_obj.id, part, part, part))
             
             if not row:
-                logger.debug(f"Failed to resolve '{part}' in {current_obj.id} ({current_path})")
+                # logger.debug(f"Failed to resolve '{part}' in {current_obj.id} ({current_path})")
                 return None
             
             child_id = row['id']
@@ -131,30 +136,37 @@ class OrchardFS(Operations):
     def getattr(self, path, fh=None):
         # logger.debug(f"getattr: {path}")
         obj = self._resolve(path)
-        if not obj: raise FuseOSError(errno.ENOENT)
         
-        attrs = {
-            'st_uid': os.getuid(), 'st_gid': os.getgid(),
-            'st_atime': obj.local.last_accessed or int(time.time()),
-            'st_mtime': obj.local.modified_at or int(time.time()),
-            'st_ctime': max(obj.local.modified_at or 0, obj.local.last_accessed or 0) or int(time.time()),
-            'st_nlink': 2 if obj.type == 'folder' else 1
-        }
-        if obj.type == 'folder':
-            attrs['st_mode'] = (stat.S_IFDIR | 0o755)
-            attrs['st_size'] = 4096
-        else:
-            attrs['st_mode'] = (stat.S_IFREG | 0o644)
-            attrs['st_size'] = obj.local.size
-        return attrs
+        # 1. Standard Object
+        if obj:
+            attrs = {
+                'st_uid': os.getuid(), 'st_gid': os.getgid(),
+                'st_atime': obj.local.last_accessed or int(time.time()),
+                'st_mtime': obj.local.modified_at or int(time.time()),
+                'st_ctime': max(obj.local.modified_at or 0, obj.local.last_accessed or 0) or int(time.time()),
+                'st_nlink': 2 if obj.type == 'folder' else 1
+            }
+            if obj.type == 'folder':
+                attrs['st_mode'] = (stat.S_IFDIR | 0o755)
+                attrs['st_size'] = 4096
+            else:
+                attrs['st_mode'] = (stat.S_IFREG | 0o644)
+                attrs['st_size'] = obj.local.size
+            return attrs
+
+        raise FuseOSError(errno.ENOENT)
 
     def readdir(self, path, fh):
-        logger.info(f"readdir: {path}")
+        # logger.info(f"readdir: {path}")
         obj = self._resolve(path)
-        if not obj or obj.type != 'folder': raise FuseOSError(errno.ENOTDIR)
+        
+        # 1. Check if folder
+        if not obj or obj.type != 'folder': 
+            raise FuseOSError(errno.ENOTDIR)
 
+        # Standard Folder Logic (from DB)
         # Stale Check: If we haven't synced this folder recently, ask for a pull
-        last_synced = getattr(obj, 'last_synced', 0) # This needs to be in DB/OrchardObject if used
+        last_synced = getattr(obj, 'last_synced', 0)
         
         logger.info(f"Checking stale for {path} (ID: {obj.id}). Last Synced: {last_synced}. Now: {int(time.time())}")
         
@@ -187,7 +199,7 @@ class OrchardFS(Operations):
         
         for child in children:
             name = child['name']
-            if child['type'] == 'file' and child['extension']:
+            if child['extension']:
                 name = f"{name}.{child['extension']}"
             dirents.append(name)
             
@@ -195,53 +207,49 @@ class OrchardFS(Operations):
 
     def open(self, path, flags):
         obj = self._resolve(path)
-        if not obj: raise FuseOSError(errno.ENOENT)
-        if obj.type == 'folder': raise FuseOSError(errno.EISDIR)
         
-        if isinstance(obj, DriveFile):
-            # Hybrid Strategy: Partial vs Full
-            # present=0 (Missing), present=1 (Full), present=2 (Partial)
-            if not obj.local.present:
-                 _, _, pid = fuse.fuse_get_context()
-                 # If thumbnailer, skip download (prevent accidental trigger)
-                 if self._is_blacklisted_process(pid): 
-                     pass
-                 elif obj.local.size < PARTIAL_THRESHOLD:
-                      # Small File -> Full Download
-                      self.db.enqueue_action(obj.id, 'ensure_latest', 'pull', priority=10)
-                 else:
-                      # Large File -> Sparse Init
-                      obj.create_sparse_placeholder()
+        # 1. Standard DriveFile
+        if obj:
+            if obj.type == 'folder': raise FuseOSError(errno.EISDIR)
+            if isinstance(obj, DriveFile):
+                if not obj.local.present:
+                     _, _, pid = fuse.fuse_get_context()
+                     if self._is_blacklisted_process(pid): 
+                         pass
+                     elif obj.local.size < PARTIAL_THRESHOLD:
+                          self.db.enqueue_action(obj.id, 'ensure_latest', 'pull', priority=10)
+                     else:
+                          obj.create_sparse_placeholder()
+                
+                obj.local.open_count += 1
+                obj.update_cache_entry()
             
-            obj.local.open_count += 1
-            obj.update_cache_entry()
-        
-        self.fd += 1
-        self.handle_map[self.fd] = obj.id
-        return self.fd
+            self.fd += 1
+            self.handle_map[self.fd] = obj.id
+            return self.fd
+
+        raise FuseOSError(errno.ENOENT)
 
     def create(self, path, mode, fi=None):
         parent_path, name = os.path.split(path)
         
+        # 1. Standard Creation
+        parent_obj = self._resolve(parent_path)
+        
         # Filter temp files
         if name.startswith('.goutputstream') or name.startswith('.Trash') or name.startswith('._'):
-            # Create local placeholder but DO NOT enqueue sync action yet
-            parent_obj = self._resolve(parent_path)
             if not parent_obj or parent_obj.type != 'folder': raise FuseOSError(errno.ENOENT)
-            
-            # We still need a DB object to track the file handle
             new_obj = DriveFile.create_new_file(self.db, parent_obj.id, name)
             self.fd += 1
             self.handle_map[self.fd] = new_obj.id
             return self.fd
 
-        parent_obj = self._resolve(parent_path)
         if not parent_obj or parent_obj.type != 'folder': raise FuseOSError(errno.ENOENT)
 
+        if str(path).startswith('/Photos'):
+            raise FuseOSError(errno.EPERM) # Photos is read-only
+
         new_obj = DriveFile.create_new_file(self.db, parent_obj.id, name)
-        # We don't queue upload here immediately. We wait for release() to capture content.
-        # But we can queue a 'touch' or empty upload if needed.
-        # For coalescing safety, queuing upload now is fine, release will update metadata.
         self.db.enqueue_action(new_obj.id, 'upload', 'push', metadata={'name': name})
         
         self.fd += 1
@@ -249,11 +257,13 @@ class OrchardFS(Operations):
         return self.fd
 
     def read(self, path, size, offset, fh):
-        obj = self._resolve(path)
-        if not isinstance(obj, DriveFile): raise FuseOSError(errno.EISDIR)
+        # 1. Standard Logic
+        obj_id = self.handle_map.get(fh)
+        if not obj_id: raise FuseOSError(errno.EBADF)
+        obj = OrchardObject.load(self.db, obj_id)
+        if not obj or not isinstance(obj, DriveFile): raise FuseOSError(errno.EISDIR)
 
         # Check if we need data (Missing (0) or Partial (2))
-        # If present=1, we have everything, skip logic
         if obj.local.present != 1:
             _, _, pid = fuse.fuse_get_context()
             if self._is_blacklisted_process(pid): raise FuseOSError(errno.EACCES)
@@ -267,40 +277,40 @@ class OrchardFS(Operations):
             missing = [c for c in needed_chunks if c not in present_chunks]
 
             if missing:
-                # Enqueue actions for missing chunks
                 for c in missing:
                     self.db.enqueue_action(
                         obj.id, 'download_chunk', 'pull',
                         metadata={'chunk_index': c}, priority=10
                     )
-                
-                # Blocking Wait Loop
-                # Timeout: 30s
                 for _ in range(60): 
-                    # Refresh state
                     row = self.db.fetchone("SELECT present_locally FROM drive_cache WHERE object_id=?", (obj.id,))
-                    if row and row['present_locally'] == 1: break # Full download completed
-                    
+                    if row and row['present_locally'] == 1: break 
                     present_chunks = self.db.get_present_chunks(obj.id)
                     if all(c in present_chunks for c in missing): break
-                    
                     time.sleep(0.5)
 
         try: return obj.read_local(size, offset)
         except: raise FuseOSError(errno.EIO)
 
     def write(self, path, data, offset, fh):
-        obj = self._resolve(path)
-        if not isinstance(obj, DriveFile): raise FuseOSError(errno.EISDIR)
+        if str(path).startswith('/Photos'): raise FuseOSError(errno.EPERM)
+        
+        # 1. Standard Logic
+        obj_id = self.handle_map.get(fh)
+        if not obj_id: raise FuseOSError(errno.EBADF)
+        obj = OrchardObject.load(self.db, obj_id)
+        if not obj or not isinstance(obj, DriveFile): raise FuseOSError(errno.EISDIR)
         
         if not obj.local.present: obj.create_local_placeholder()
         ret = obj.write_local(data, offset)
-        # Note: We removed the enqueue_action here. We do it in release()
         return ret
 
     def truncate(self, path, length, fh=None):
+        if str(path).startswith('/Photos'): raise FuseOSError(errno.EPERM)
+        
+        # 1. Standard Logic
         obj = self._resolve(path)
-        if not isinstance(obj, DriveFile): raise FuseOSError(errno.EIO)
+        if not obj or not isinstance(obj, DriveFile): raise FuseOSError(errno.EIO)
         
         path_loc = obj.get_local_full_path()
         if not os.path.exists(path_loc): obj.create_local_placeholder()
@@ -314,13 +324,14 @@ class OrchardFS(Operations):
 
     def release(self, path, fh):
         """Called when file is closed. Checks for changes and queues upload."""
+        # 1. Standard Logic
         obj_id = self.handle_map.pop(fh, None)
         if obj_id:
             obj = OrchardObject.load(self.db, obj_id)
         else:
             obj = self._resolve(path)
 
-        if not isinstance(obj, DriveFile): return 0
+        if not obj or not isinstance(obj, DriveFile): return 0
         
         # Decrement Open Count
         if obj.local.open_count > 0:
@@ -380,6 +391,9 @@ class OrchardFS(Operations):
         return 0
 
     def rename(self, old_path, new_path):
+        if str(old_path).startswith('/Photos') or str(new_path).startswith('/Photos'):
+            raise FuseOSError(errno.EPERM)
+            
         old_parent, old_name = os.path.split(old_path)
         new_parent, new_name = os.path.split(new_path)
         obj = self._resolve(old_path)
@@ -420,6 +434,8 @@ class OrchardFS(Operations):
         if old_path in self.path_to_id: del self.path_to_id[old_path]
 
     def unlink(self, path):
+        if str(path).startswith('/Photos'): raise FuseOSError(errno.EPERM)
+        
         obj = self._resolve(path)
         if not obj: raise FuseOSError(errno.ENOENT)
         
@@ -432,6 +448,8 @@ class OrchardFS(Operations):
         if path in self.path_to_id: del self.path_to_id[path]
 
     def mkdir(self, path, mode):
+        if str(path).startswith('/Photos'): raise FuseOSError(errno.EPERM)
+        
         parent_path, name = os.path.split(path)
         parent = self._resolve(parent_path)
         if not parent: raise FuseOSError(errno.ENOENT)
@@ -440,6 +458,8 @@ class OrchardFS(Operations):
         self.db.enqueue_action(new_obj.id, 'upload', 'push', metadata={'name': name})
 
     def rmdir(self, path):
+        if str(path).startswith('/Photos'): raise FuseOSError(errno.EPERM)
+        
         # reuse unlink logic mostly, but check empty
         obj = self._resolve(path)
         if not obj: raise FuseOSError(errno.ENOENT)
@@ -506,10 +526,15 @@ class OrchardFS(Operations):
             is_pinned = (value == b'1' or value == b'true')
             val_int = 1 if is_pinned else 0
             
+            local_path = None
+            if isinstance(obj, DriveFile):
+                local_path = obj.get_local_full_path()
+
             self.db.execute("""
-                INSERT OR IGNORE INTO drive_cache (object_id, pinned) VALUES (?, ?)
-            """, (obj.id, val_int))
-            self.db.execute("UPDATE drive_cache SET pinned=? WHERE object_id=?", (val_int, obj.id))
+                INSERT OR IGNORE INTO drive_cache (object_id, pinned, local_path) VALUES (?, ?, ?)
+            """, (obj.id, val_int, local_path))
+            # Ensure local_path is set if it was NULL
+            self.db.execute("UPDATE drive_cache SET pinned=?, local_path=COALESCE(local_path, ?) WHERE object_id=?", (val_int, local_path, obj.id))
             
             if is_pinned:
                 # If pinning, ensure we have the full file
@@ -536,4 +561,17 @@ class OrchardFS(Operations):
 
 def mount_daemon(db_path, mount_point):
     if not os.path.exists(mount_point): os.makedirs(mount_point)
-    FUSE(OrchardFS(db_path), mount_point, foreground=True)
+    
+    try:
+        FUSE(OrchardFS(db_path), mount_point, foreground=True)
+    except Exception as e:
+        logger.error(f"Mount failed: {e}. Attempting to clean up and retry...")
+        try:
+            # Force unmount lazy
+            subprocess.run(["fusermount", "-u", "-z", mount_point], check=False)
+            time.sleep(1) # Give it a moment
+            # Retry
+            FUSE(OrchardFS(db_path), mount_point, foreground=True)
+        except Exception as retry_e:
+             logger.critical(f"Fatal: Mount retry failed: {retry_e}")
+             raise retry_e

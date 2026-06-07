@@ -8,43 +8,83 @@ import shutil
 import tempfile
 import requests
 import concurrent.futures
+from datetime import datetime, timezone
 
 from src.db.orchardDB import OrchardDB
 from src.icloud_client.icloud_drive import iCloudDrive, CLOUD_DOCS_ZONE_ID_ROOT
 from src.icloud_client.client import OrchardiCloudClient
-from src.objects.drive import DriveFile, DriveFolder 
+from src.objects.drive import DriveFile, DriveFolder
 from src.objects.base import OrchardObject
 from src.config.sync_states import (
-    SYNC_STATE_SYNCHRONIZED, 
-    SYNC_STATE_PENDING_PUSH, 
-    SYNC_STATE_PENDING_PULL, 
-    SYNC_STATE_CONFLICT, 
-    SYNC_STATE_ERROR
+    SYNC_STATE_SYNCHRONIZED,
+    SYNC_STATE_PENDING_PUSH,
+    SYNC_STATE_PENDING_PULL,
+    SYNC_STATE_CONFLICT,
+    SYNC_STATE_ERROR,
 )
 from src.config.sync_config import MAX_RETRIES, BASE_BACKOFF_SECONDS
+
+import socket
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 8 * 1024 * 1024
+
 
 class SyncEngine:
     def __init__(self, db: OrchardDB, api_client: OrchardiCloudClient):
         self.db = db
         self.api = api_client
         self.running = False
+        self.paused = False
         self.drive_svc: iCloudDrive = None
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-        
+        self.last_conn_check = 0
+        self.storage_info = None
+        self.last_storage_check = 0
+
         # Initial setup handled in _ensure_service called by start/_loop
+
+    def check_connection(self, host="1.1.1.1", port=53, timeout=3):
+        """Check for internet connectivity."""
+        try:
+            socket.setdefaulttimeout(timeout)
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+            return True
+        except socket.error:
+            return False
+
+    def fetch_storage_usage(self):
+        """Fetches remote storage usage info."""
+        if self.api and self.api.authenticated:
+            try:
+                logger.info("Fetching storage usage info...")
+                info = self.api.get_storage_usage()
+                if info:
+                    self.storage_info = info
+                    logger.info("Storage usage updated successfully.")
+                else:
+                    logger.warning("Storage usage fetch returned empty.")
+            except Exception as e:
+                logger.error(f"Error fetching storage info: {e}")
 
     def start(self):
         self.running = True
         logger.info(f"Sync Engine Started at {time.ctime()}.")
+
+        # Crash Recovery: Reset any tasks stuck in 'processing' from previous run
+        logger.info("Resetting stuck 'processing' tasks to 'pending'...")
+        self.db.execute("UPDATE actions SET status='pending' WHERE status='processing'")
+
         self._loop()
 
     def stop(self):
         self.running = False
         self.executor.shutdown(wait=False)
+
+    @property
+    def connected(self):
+        return self.drive_svc is not None
 
     def _ensure_service(self):
         """Checks if drive service is available; attempts to reconnect if not."""
@@ -52,71 +92,126 @@ class SyncEngine:
             return True
 
         try:
-            if self.api:
-                # If started offline, we might not be authenticated yet.
-                if not self.api.authenticated:
-                    logger.info("Client not authenticated. Attempting to authenticate...")
-                    try:
-                        self.api.authenticate()
-                        if not self.api.authenticated:
-                            logger.warning("Authentication attempt failed. Remaining offline.")
+            if self.check_connection():  # Verify net before auth
+                if self.api:
+                    # If started offline, we might not be authenticated yet.
+                    if not self.api.authenticated:
+                        logger.info(
+                            "Client not authenticated. Attempting to authenticate..."
+                        )
+                        try:
+                            self.api.authenticate()
+                            if not self.api.authenticated:
+                                logger.warning(
+                                    "Authentication attempt failed. Remaining offline."
+                                )
+                                return False
+                        except Exception as auth_e:
+                            logger.warning(f"Authentication failed: {auth_e}")
                             return False
-                    except Exception as auth_e:
-                        logger.warning(f"Authentication failed: {auth_e}")
-                        return False
 
-                # Refresh session if needed (implementation dependent, usually handled by pyicloud)
-                # But we need to ensure we can talk to the API
-                logger.info("Attempting to connect to iCloud Drive...")
-                
-                ds_root = self.api.get_webservice_url("drivews")
-                doc_root = self.api.get_webservice_url("docws")
-                
-                if ds_root and doc_root:
-                    self.drive_svc = iCloudDrive(self.api.session, ds_root, doc_root, self.api._pyicloud_service.params)
-                    logger.info("iCloudDrive service connected/restored.")
-                    
-                    # Requirement 1: Perform sync on internet back
-                    self._pull_metadata()
-                    return True
+                    # Refresh session if needed (implementation dependent, usually handled by pyicloud)
+                    # But we need to ensure we can talk to the API
+                    logger.info("Attempting to connect to iCloud Services...")
+
+                    ds_root = self.api.get_webservice_url("drivews")
+                    doc_root = self.api.get_webservice_url("docws")
+
+                    if ds_root and doc_root:
+                        self.drive_svc = iCloudDrive(
+                            self.api.session,
+                            ds_root,
+                            doc_root,
+                            self.api._pyicloud_service.params,
+                        )
+                        logger.info("iCloudDrive service connected.")
+
+                    if self.drive_svc:
+                        # Requirement 1: Perform sync on internet back
+                        self._pull_metadata()
+                        return True
         except Exception as e:
             logger.debug(f"Connection attempt failed: {e}")
-        
+
         return False
 
     def _loop(self):
         while self.running:
+            if self.paused:
+                time.sleep(1)
+                continue
+
             # Check Connection
             if not self._ensure_service():
-                time.sleep(10) # Wait for internet
+                logger.warning("Service check failed. Sleeping...")
+                time.sleep(10)  # Wait for internet
                 continue
+
+            # Periodic Storage Check (every 5 mins)
+            if time.time() - self.last_storage_check > 300:
+                self.last_storage_check = time.time()
+                self.executor.submit(self.fetch_storage_usage)
 
             task = self._get_next_retryable_action()
             if task:
+                logger.info(
+                    f"Picked up task {task['action_id']} ({task['action_type']})"
+                )
                 # Dispatch IO tasks to threads, keep Metadata tasks on main thread (priority)
-                if task['action_type'] in ['upload', 'download', 'update_content', 'download_chunk']:
+                if task["action_type"] in [
+                    "upload",
+                    "download",
+                    "update_content",
+                    "download_chunk",
+                ]:
                     self.executor.submit(self._safe_process_task, task)
                 else:
                     self._safe_process_task(task)
             else:
-                time.sleep(0.1) # Faster polling for responsiveness
+                # Idle Check: Poll connectivity every 10s
+                if time.time() - self.last_conn_check > 10:
+                    self.last_conn_check = time.time()
+                    if not self.check_connection():
+                        logger.info("Connection lost (Idle check). Pausing service.")
+                        self.drive_svc = None
+                        continue
+
+                time.sleep(0.1)  # Faster polling for responsiveness
 
     def _safe_process_task(self, task):
         try:
             self._process_task(task)
-            self.db.complete_action(task['action_id'])
+            self.db.complete_action(task["action_id"])
         except Exception as e:
             err_str = str(e)
             # Network Error Detection
-            if any(x in err_str for x in ["Connection", "Timeout", "503", "409", "socket", "Client Error"]):
-                logger.warning(f"Network/Service error executing task {task['action_id']}: {e}. Pausing service for reconnection.")
-                self.drive_svc = None # Force reconnection logic
+            if any(
+                x in err_str
+                for x in [
+                    "Connection",
+                    "Timeout",
+                    "503",
+                    "409",
+                    "socket",
+                    "Client Error",
+                ]
+            ):
+                logger.warning(
+                    f"Network/Service error executing task {task['action_id']}: {e}. Pausing service for reconnection."
+                )
+                self.drive_svc = None  # Force reconnection logic
                 # Reset to pending so it's picked up again
-                self.db.execute("UPDATE actions SET status='pending' WHERE action_id=?", (task['action_id'],))
-                time.sleep(2) # Backoff slightly
+                self.db.execute(
+                    "UPDATE actions SET status='pending' WHERE action_id=?",
+                    (task["action_id"],),
+                )
+                time.sleep(2)  # Backoff slightly
             else:
-                logger.error(f"Task {task['action_type']} (ID: {task['action_id']}) failed: {e}", exc_info=True)
-                self.db.fail_action(task['action_id'], task['target_id'], str(e))
+                logger.error(
+                    f"Task {task['action_type']} (ID: {task['action_id']}) failed: {e}",
+                    exc_info=True,
+                )
+                self.db.fail_action(task["action_id"], task["target_id"], str(e))
 
     def _get_next_retryable_action(self):
         now = int(time.time())
@@ -129,100 +224,119 @@ class SyncEngine:
             ORDER BY created_at ASC LIMIT 1
         """).fetchone()
         if row:
-            self.db.execute("UPDATE actions SET status = 'processing' WHERE action_id = ?", (row['action_id'],))
+            self.db.execute(
+                "UPDATE actions SET status = 'processing' WHERE action_id = ?",
+                (row["action_id"],),
+            )
             return dict(row)
 
         # 2. Retryable Failed (Backoff)
-        row = conn.execute(f"""
+        row = conn.execute(
+            f"""
             SELECT *, (created_at + ({BASE_BACKOFF_SECONDS} * POWER(2, retry_count))) as next_retry_time
             FROM actions 
             WHERE status = 'failed' AND next_retry_time <= ?
             ORDER BY next_retry_time ASC, created_at ASC LIMIT 1
-        """, (now,)).fetchone()
-        
+        """,
+            (now,),
+        ).fetchone()
+
         if row:
-            self.db.execute("UPDATE actions SET status = 'processing' WHERE action_id = ?", (row['action_id'],))
+            self.db.execute(
+                "UPDATE actions SET status = 'processing' WHERE action_id = ?",
+                (row["action_id"],),
+            )
             return dict(row)
-        
+
         return None
 
     def _process_task(self, task):
-        obj_id = task['target_id']
-        action = task['action_type']
-        direction = task['direction']
-        dest = task['destination']
-        
-        metadata = json.loads(task['metadata']) if task['metadata'] else {}
-        
-        # Root listing special case
-        if action == 'list_children' and obj_id == 'drive_root':
-             self._pull_drive_folder(CLOUD_DOCS_ZONE_ID_ROOT, 'drive_root')
-             return
+        obj_id = task["target_id"]
+        action = task["action_type"]
+        direction = task["direction"]
+        dest = task["destination"]
+
+        metadata = json.loads(task["metadata"]) if task["metadata"] else {}
+
+        # Root listing special cases
+        if action == "list_children":
+            if obj_id == "drive_root":
+                self._pull_drive_folder(CLOUD_DOCS_ZONE_ID_ROOT, "drive_root")
+                return
 
         obj = OrchardObject.load(self.db, obj_id)
-        
-        # Subfolder listing special case
-        if action == 'list_children' and obj and obj.cloud.id:
-             self._pull_drive_folder(obj.cloud.id, obj.id)
-             return
 
-        if not obj:
-            if action == 'delete':
-                self._handle_delete_by_id(obj_id)
-                return
-            logger.warning(f"Object (ID: {obj_id}) not found for action '{action}'. Skipping.")
+        # Subfolder listing special case
+        if action == "list_children" and obj and obj.cloud.id:
+            self._pull_drive_folder(obj.cloud.id, obj.id)
             return
 
-        if direction == 'push':
-            if action == 'upload':
+        if not obj:
+            if action == "delete":
+                self._handle_delete_by_id(obj_id)
+                return
+            logger.warning(
+                f"Object (ID: {obj_id}) not found for action '{action}'. Skipping."
+            )
+            return
+
+        if direction == "push":
+            if action == "upload":
                 self._handle_upload(obj, metadata)
-            elif action == 'update_content':
+            elif action == "update_content":
                 self._handle_update_content(obj, metadata)
-            elif action == 'rename':
+            elif action == "rename":
                 self._handle_rename(obj, dest, metadata)
-            elif action == 'move':
+            elif action == "move":
                 self._handle_move(obj, dest, metadata)
-            elif action == 'delete':
+            elif action == "delete":
                 self._handle_delete(obj)
-        elif direction == 'pull':
-            if action == 'download':
+        elif direction == "pull":
+            if action == "download":
                 self._handle_download(obj)
-            elif action == 'download_chunk':
+            elif action == "download_chunk":
                 self._handle_download_chunk(obj, metadata)
-            elif action == 'ensure_latest':
+            elif action == "ensure_latest":
                 self._handle_ensure_latest(obj)
 
     # ----------------------------------------------------------------
-    # HANDLERS
+    # EXISTING HANDLERS (Drive)
     # ----------------------------------------------------------------
-    
+
     def _handle_download_chunk(self, obj, metadata):
-        chunk_idx = metadata['chunk_index']
-        
-        if self.db.has_chunk(obj.id, chunk_idx): return
+        chunk_idx = metadata["chunk_index"]
+
+        if self.db.has_chunk(obj.id, chunk_idx):
+            return
 
         start_byte = chunk_idx * CHUNK_SIZE
         # Ensure we don't go past file size
         end_byte = min((chunk_idx + 1) * CHUNK_SIZE - 1, obj.local.size - 1)
-        
+
         # Guard against zero-byte files or bad math
         if start_byte >= obj.local.size:
-            logger.warning(f"Chunk {chunk_idx} starts at {start_byte} but file size is {obj.local.size}")
+            logger.warning(
+                f"Chunk {chunk_idx} starts at {start_byte} but file size is {obj.local.size}"
+            )
             return
 
         data = self.drive_svc.download_file_part(obj.cloud.id, start_byte, end_byte)
-        
+
         local_path = obj.get_local_full_path()
         if not os.path.exists(local_path):
-             with open(local_path, 'wb') as f: f.truncate(obj.local.size)
+            with open(local_path, "wb") as f:
+                f.truncate(obj.local.size)
 
-        with open(local_path, 'r+b') as f:
+        with open(local_path, "r+b") as f:
             f.seek(start_byte)
             f.write(data)
-            
+
         self.db.add_chunk(obj.id, chunk_idx)
         # Mark as partially present (2) ONLY if not already full (1)
-        self.db.execute("UPDATE drive_cache SET present_locally=2, last_accessed=? WHERE object_id=? AND present_locally != 1", (int(time.time()), obj.id))
+        self.db.execute(
+            "UPDATE drive_cache SET present_locally=2, last_accessed=? WHERE object_id=? AND present_locally != 1",
+            (int(time.time()), obj.id),
+        )
 
     def _pull_drive_folder(self, cloud_id, local_parent_id):
         try:
@@ -232,104 +346,173 @@ class SyncEngine:
             return
 
         # Update parent last_synced to prevent redundant pulls
-        self.db.execute("UPDATE objects SET last_synced=? WHERE id=?", (int(time.time()), local_parent_id))
+        self.db.execute(
+            "UPDATE objects SET last_synced=? WHERE id=?",
+            (int(time.time()), local_parent_id),
+        )
 
         for item in items:
-            c_id = item.get('drivewsid') or item.get('docwsid')
-            if not c_id: continue
-            
-            etag = item.get('etag')
-            name = item.get('name')
-            extension = item.get('extension') 
-            size = item.get('size', 0)
-            item_type = item.get('type', 'FILE').lower()
-            if item_type == 'app_library': item_type = 'folder' 
+            c_id = item.get("drivewsid") or item.get("docwsid")
+            if not c_id:
+                continue
 
-            existing = self.db.fetchone("SELECT * FROM objects WHERE cloud_id=?", (c_id,))
+            etag = item.get("etag")
+            name = item.get("name")
+            extension = item.get("extension")
+            size = item.get("size", 0)
+            item_type = item.get("type", "FILE").lower()
+            if item_type == "app_library":
+                item_type = "folder"
+
+            existing = self.db.fetchone(
+                "SELECT * FROM objects WHERE cloud_id=?", (c_id,)
+            )
 
             if existing:
-                if existing['dirty']: continue # Conflict check
-                
-                # Check for Etag Change
-                if existing['etag'] != etag:
-                    # Mark local cache as stale if it exists
-                    cache_row = self.db.fetchone("SELECT present_locally FROM drive_cache WHERE object_id=?", (existing['id'],))
-                    if cache_row and cache_row['present_locally']:
-                        logger.info(f"File {name} changed on cloud. Marking local cache stale.")
-                        self.db.execute("UPDATE drive_cache SET present_locally=0 WHERE object_id=?", (existing['id'],))
+                if existing["dirty"]:
+                    continue  # Conflict check
 
-                # FIX: Do not update last_synced for folders here. 
+                # Check for Etag Change
+                if existing["etag"] != etag:
+                    # Mark local cache as stale if it exists
+                    cache_row = self.db.fetchone(
+                        "SELECT present_locally FROM drive_cache WHERE object_id=?",
+                        (existing["id"],),
+                    )
+                    if cache_row and cache_row["present_locally"]:
+                        logger.info(
+                            f"File {name} changed on cloud. Marking local cache stale."
+                        )
+                        self.db.execute(
+                            "UPDATE drive_cache SET present_locally=0 WHERE object_id=?",
+                            (existing["id"],),
+                        )
+
+                # FIX: Do not update last_synced for folders here.
                 # last_synced on a folder means "when we listed ITS children".
                 # We are only listing the parent here.
-                if item_type == 'folder':
-                     self.db.execute("""
+                if item_type == "folder":
+                    self.db.execute(
+                        """
                         UPDATE objects 
                         SET etag=?, name=?, extension=?, size=?, type=?, cloud_parent_id=?, missing_from_cloud=0
                         WHERE cloud_id=?
-                    """, (etag, name, extension, size, item_type, cloud_id, c_id))
+                    """,
+                        (etag, name, extension, size, item_type, cloud_id, c_id),
+                    )
                 else:
-                     self.db.execute("""
+                    self.db.execute(
+                        """
                         UPDATE objects 
                         SET etag=?, name=?, extension=?, size=?, type=?, cloud_parent_id=?, last_synced=?, missing_from_cloud=0
                         WHERE cloud_id=?
-                    """, (etag, name, extension, size, item_type, cloud_id, int(time.time()), c_id))
-                
-                self.db.update_shadow(existing['id'], cloud_id=c_id, parent_id=local_parent_id, etag=etag, name=name, modified_at=int(time.time()))
+                    """,
+                        (
+                            etag,
+                            name,
+                            extension,
+                            size,
+                            item_type,
+                            cloud_id,
+                            int(time.time()),
+                            c_id,
+                        ),
+                    )
+
+                obj_id = existing["id"]
+                self.db.update_shadow(
+                    obj_id,
+                    cloud_id=c_id,
+                    parent_id=local_parent_id,
+                    etag=etag,
+                    name=name,
+                    modified_at=int(time.time()),
+                )
             else:
                 new_id = str(uuid.uuid4())
                 # For new folders, last_synced should be 0 (never listed children)
-                initial_last_synced = int(time.time()) if item_type == 'file' else 0
-                
-                self.db.execute("""
+                initial_last_synced = int(time.time()) if item_type == "file" else 0
+
+                self.db.execute(
+                    """
                     INSERT INTO objects (id, type, parent_id, name, extension, size, cloud_id, cloud_parent_id, etag, sync_state, last_synced)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    new_id, item_type, local_parent_id, name, extension, size, 
-                    c_id, cloud_id, etag, SYNC_STATE_SYNCHRONIZED, initial_last_synced
-                ))
-                self.db.update_shadow(new_id, cloud_id=c_id, parent_id=local_parent_id, name=name, etag=etag, modified_at=int(time.time()))
+                """,
+                    (
+                        new_id,
+                        item_type,
+                        local_parent_id,
+                        name,
+                        extension,
+                        size,
+                        c_id,
+                        cloud_id,
+                        etag,
+                        SYNC_STATE_SYNCHRONIZED,
+                        initial_last_synced,
+                    ),
+                )
+                self.db.update_shadow(
+                    new_id,
+                    cloud_id=c_id,
+                    parent_id=local_parent_id,
+                    name=name,
+                    etag=etag,
+                    modified_at=int(time.time()),
+                )
+                obj_id = new_id
 
     def _handle_upload(self, obj, metadata):
-        target_name = metadata.get('name', obj.local.name)
-        target_hash = metadata.get('file_hash')
+        target_name = metadata.get("name", obj.local.name)
+        target_hash = metadata.get("file_hash")
 
         # --- STABILITY CHECK START ---
         if isinstance(obj, DriveFile):
             # 1. Check Open Count
-            cache = self.db.fetchone("SELECT open_count FROM drive_cache WHERE object_id=?", (obj.id,))
-            if cache and cache['open_count'] > 0:
-                logger.info(f"Deferring upload for {obj.id}: File is open (count={cache['open_count']})")
+            cache = self.db.fetchone(
+                "SELECT open_count FROM drive_cache WHERE object_id=?", (obj.id,)
+            )
+            if cache and cache["open_count"] > 0:
+                logger.info(
+                    f"Deferring upload for {obj.id}: File is open (count={cache['open_count']})"
+                )
                 raise Exception("File is open for writing (Stability Check)")
 
             # 2. Check Size Stability
             try:
                 path = obj.get_local_full_path()
                 size_t0 = os.path.getsize(path)
-                time.sleep(2.0) # Wait for potential writes
+                time.sleep(2.0)  # Wait for potential writes
                 size_t1 = os.path.getsize(path)
-                
+
                 if size_t0 != size_t1:
-                    logger.info(f"Deferring upload for {obj.id}: File is growing ({size_t0} -> {size_t1})")
+                    logger.info(
+                        f"Deferring upload for {obj.id}: File is growing ({size_t0} -> {size_t1})"
+                    )
                     raise Exception("File is growing (Stability Check)")
             except FileNotFoundError:
-                pass # Will be caught later
+                pass  # Will be caught later
         # --- STABILITY CHECK END ---
 
         shadow = self.db.get_shadow(obj.id)
-        if shadow and target_hash and shadow['file_hash'] == target_hash:
+        if shadow and target_hash and shadow["file_hash"] == target_hash:
             logger.info(f"Skipping upload for {obj.id}: Shadow hash matches intent.")
             self._mark_synced(obj)
             return
 
         # Resolve Parent Cloud ID
         parent_cloud_id = None
-        if obj.local.parent_id == 'drive_root': 
+        if obj.local.parent_id == "drive_root":
             parent_cloud_id = CLOUD_DOCS_ZONE_ID_ROOT
         else:
-            p_row = self.db.fetchone("SELECT cloud_id FROM objects WHERE id=?", (obj.local.parent_id,))
-            if p_row: parent_cloud_id = p_row['cloud_id']
-        
-        if not parent_cloud_id: raise Exception(f"Parent {obj.local.parent_id} has no cloud ID")
+            p_row = self.db.fetchone(
+                "SELECT cloud_id FROM objects WHERE id=?", (obj.local.parent_id,)
+            )
+            if p_row:
+                parent_cloud_id = p_row["cloud_id"]
+
+        if not parent_cloud_id:
+            raise Exception(f"Parent {obj.local.parent_id} has no cloud ID")
 
         full_name = target_name
         if obj.local.extension and not target_name.endswith(f".{obj.local.extension}"):
@@ -338,81 +521,126 @@ class SyncEngine:
         # Conflict Prevention: Delete existing remote file with same name
         try:
             children = self.drive_svc.list_directory(parent_cloud_id)
-            conflict_item = next((i for i in children if i.get('name') == full_name), None)
-            
+            conflict_item = next(
+                (i for i in children if i.get("name") == full_name), None
+            )
+
             if conflict_item:
-                c_id = conflict_item.get('docwsid', conflict_item.get('drivewsid'))
-                c_etag = conflict_item.get('etag')
-                logger.info(f"Pre-upload conflict: {full_name} exists (ID: {c_id}). Deleting remote to enforce Local Wins.")
+                c_id = conflict_item.get("docwsid", conflict_item.get("drivewsid"))
+                c_etag = conflict_item.get("etag")
+                logger.info(
+                    f"Pre-upload conflict: {full_name} exists (ID: {c_id}). Deleting remote to enforce Local Wins."
+                )
                 self.drive_svc.delete_item(c_id, c_etag)
         except Exception as e:
             logger.warning(f"Error checking conflicts during upload: {e}")
 
         if isinstance(obj, DriveFile):
             local_cache_path = obj.get_local_full_path()
-            if not os.path.exists(local_cache_path): raise FileNotFoundError(local_cache_path)
+            if not os.path.exists(local_cache_path):
+                raise FileNotFoundError(local_cache_path)
 
-            logger.info(f"Uploading '{full_name}' (ID: {obj.id}) to CloudID: {parent_cloud_id}")
-            
+            logger.info(
+                f"Uploading '{full_name}' (ID: {obj.id}) to CloudID: {parent_cloud_id}"
+            )
+
             with tempfile.TemporaryDirectory() as temp_dir:
                 symlink_path = os.path.join(temp_dir, full_name)
                 os.symlink(local_cache_path, symlink_path)
-                
+
                 try:
                     resp = self.drive_svc.upload_file(symlink_path, parent_cloud_id)
-                    
-                    new_cloud_id = resp.get('document_id') or resp.get('docwsid')
-                    new_etag = resp.get('etag')
-                    new_size = resp.get('size')
-                    
+
+                    new_cloud_id = resp.get("document_id") or resp.get("docwsid")
+                    new_etag = resp.get("etag")
+                    new_size = resp.get("size")
+
                     if new_cloud_id:
-                        self._update_db_and_shadow(obj, new_cloud_id, new_etag, new_size, target_hash, parent_cloud_id)
+                        self._update_db_and_shadow(
+                            obj,
+                            new_cloud_id,
+                            new_etag,
+                            new_size,
+                            target_hash,
+                            parent_cloud_id,
+                        )
                 except Exception as e:
                     # Handle 412 Conflict (Precondition Failed) - though pre-check should catch most
                     is_conflict = False
-                    if "412" in str(e) or "Precondition Failed" in str(e): is_conflict = True
-                    elif hasattr(e, '__cause__') and e.__cause__ and ("412" in str(e.__cause__) or "Precondition Failed" in str(e.__cause__)): is_conflict = True
+                    if "412" in str(e) or "Precondition Failed" in str(e):
+                        is_conflict = True
+                    elif (
+                        hasattr(e, "__cause__")
+                        and e.__cause__
+                        and (
+                            "412" in str(e.__cause__)
+                            or "Precondition Failed" in str(e.__cause__)
+                        )
+                    ):
+                        is_conflict = True
 
                     if is_conflict:
-                        logger.warning(f"Upload conflict (412) for '{full_name}'. Attempting overwrite...")
+                        logger.warning(
+                            f"Upload conflict (412) for '{full_name}'. Attempting overwrite..."
+                        )
                         try:
                             # Re-list to be sure
                             children = self.drive_svc.list_directory(parent_cloud_id)
-                            conflict_item = next((i for i in children if i.get('name') == full_name), None)
-                            
+                            conflict_item = next(
+                                (i for i in children if i.get("name") == full_name),
+                                None,
+                            )
+
                             if conflict_item:
-                                c_id = conflict_item.get('docwsid', conflict_item.get('drivewsid'))
-                                c_etag = conflict_item.get('etag')
+                                c_id = conflict_item.get(
+                                    "docwsid", conflict_item.get("drivewsid")
+                                )
+                                c_etag = conflict_item.get("etag")
                                 self.drive_svc.delete_item(c_id, c_etag)
-                                
-                                resp = self.drive_svc.upload_file(symlink_path, parent_cloud_id)
-                                new_cloud_id = resp.get('document_id') or resp.get('docwsid')
-                                new_etag = resp.get('etag')
-                                new_size = resp.get('size')
-                                
+
+                                resp = self.drive_svc.upload_file(
+                                    symlink_path, parent_cloud_id
+                                )
+                                new_cloud_id = resp.get("document_id") or resp.get(
+                                    "docwsid"
+                                )
+                                new_etag = resp.get("etag")
+                                new_size = resp.get("size")
+
                                 if new_cloud_id:
-                                    self._update_db_and_shadow(obj, new_cloud_id, new_etag, new_size, target_hash, parent_cloud_id)
+                                    self._update_db_and_shadow(
+                                        obj,
+                                        new_cloud_id,
+                                        new_etag,
+                                        new_size,
+                                        target_hash,
+                                        parent_cloud_id,
+                                    )
                             else:
                                 raise e
                         except Exception as retry_e:
-                            logger.error(f"Failed to resolve conflict for {obj.id}: {retry_e}")
+                            logger.error(
+                                f"Failed to resolve conflict for {obj.id}: {retry_e}"
+                            )
                             raise e
                     else:
                         raise e
 
         elif isinstance(obj, DriveFolder):
             self.drive_svc.create_folder(parent_cloud_id, full_name)
-            self.db.enqueue_action(obj.local.parent_id, 'list_children', 'pull')
+            self.db.enqueue_action(obj.local.parent_id, "list_children", "pull")
             self._mark_synced(obj)
 
     def _handle_update_content(self, obj, metadata):
         # Apply Stability Check here as well
         if isinstance(obj, DriveFile):
-            cache = self.db.fetchone("SELECT open_count FROM drive_cache WHERE object_id=?", (obj.id,))
-            if cache and cache['open_count'] > 0:
+            cache = self.db.fetchone(
+                "SELECT open_count FROM drive_cache WHERE object_id=?", (obj.id,)
+            )
+            if cache and cache["open_count"] > 0:
                 logger.info(f"Deferring update for {obj.id}: File is open")
                 raise Exception("File is open (Stability Check)")
-            
+
             try:
                 path = obj.get_local_full_path()
                 size_t0 = os.path.getsize(path)
@@ -421,71 +649,87 @@ class SyncEngine:
                 if size_t0 != size_t1:
                     logger.info(f"Deferring update for {obj.id}: File is growing")
                     raise Exception("File is growing (Stability Check)")
-            except: pass
+            except:
+                pass
 
-        if not obj.cloud.id: return self._handle_upload(obj, metadata)
-        
-        target_hash = metadata.get('file_hash')
+        if not obj.cloud.id:
+            return self._handle_upload(obj, metadata)
+
+        target_hash = metadata.get("file_hash")
         shadow = self.db.get_shadow(obj.id)
-        if shadow and target_hash and shadow['file_hash'] == target_hash:
+        if shadow and target_hash and shadow["file_hash"] == target_hash:
             return
 
         logger.info(f"Updating content for {obj.id}")
-        
+
         # Robust Parent Resolution
         parent_id = obj.cloud.parent_id
         if not parent_id:
-             if obj.local.parent_id == 'drive_root': parent_id = CLOUD_DOCS_ZONE_ID_ROOT
-             else:
-                 p_row = self.db.fetchone("SELECT cloud_id FROM objects WHERE id=?", (obj.local.parent_id,))
-                 if p_row: parent_id = p_row['cloud_id']
+            if obj.local.parent_id == "drive_root":
+                parent_id = CLOUD_DOCS_ZONE_ID_ROOT
+            else:
+                p_row = self.db.fetchone(
+                    "SELECT cloud_id FROM objects WHERE id=?", (obj.local.parent_id,)
+                )
+                if p_row:
+                    parent_id = p_row["cloud_id"]
 
         # Try to delete old version first
         meta = self.drive_svc.get_item_metadata(obj.cloud.id, parent_id=parent_id)
         if meta:
-            self.drive_svc.delete_item(obj.cloud.id, meta['etag'])
-        
+            self.drive_svc.delete_item(obj.cloud.id, meta["etag"])
+
         # Upload new version
         self._handle_upload(obj, metadata)
 
     def _handle_rename(self, obj, dest, metadata):
-        target_name = metadata.get('to_name', dest)
-        if not obj.cloud.id: return
+        target_name = metadata.get("to_name", dest)
+        if not obj.cloud.id:
+            return
 
         # Robust Parent Resolution for Rename
         parent_id = obj.cloud.parent_id
         if not parent_id:
-             if obj.local.parent_id == 'drive_root': 
-                 parent_id = CLOUD_DOCS_ZONE_ID_ROOT
-             else:
-                 # Fallback to local parent lookup
-                 p_row = self.db.fetchone("SELECT cloud_id FROM objects WHERE id=?", (obj.local.parent_id,))
-                 if p_row: parent_id = p_row['cloud_id']
-        
+            if obj.local.parent_id == "drive_root":
+                parent_id = CLOUD_DOCS_ZONE_ID_ROOT
+            else:
+                # Fallback to local parent lookup
+                p_row = self.db.fetchone(
+                    "SELECT cloud_id FROM objects WHERE id=?", (obj.local.parent_id,)
+                )
+                if p_row:
+                    parent_id = p_row["cloud_id"]
+
         # Conflict Check: Does target name exist?
         try:
             children = self.drive_svc.list_directory(parent_id)
-            conflict_item = next((i for i in children if i.get('name') == target_name), None)
-            
+            conflict_item = next(
+                (i for i in children if i.get("name") == target_name), None
+            )
+
             if conflict_item:
-                c_id = conflict_item.get('docwsid', conflict_item.get('drivewsid'))
-                c_etag = conflict_item.get('etag')
+                c_id = conflict_item.get("docwsid", conflict_item.get("drivewsid"))
+                c_etag = conflict_item.get("etag")
                 # Check if it is NOT the item we are renaming (just to be safe)
                 if c_id != obj.cloud.id:
-                    logger.info(f"Conflict detected for rename: {target_name} exists (ID: {c_id}). Deleting remote conflict.")
+                    logger.info(
+                        f"Conflict detected for rename: {target_name} exists (ID: {c_id}). Deleting remote conflict."
+                    )
                     self.drive_svc.delete_item(c_id, c_etag)
         except Exception as e:
             logger.warning(f"Error checking conflicts during rename: {e}")
 
         meta = self.drive_svc.get_item_metadata(obj.cloud.id, parent_id=parent_id)
-        if not meta: 
-            logger.warning(f"Could not find metadata for {obj.id} (CloudID: {obj.cloud.id}, Parent: {parent_id})")
-            return 
+        if not meta:
+            logger.warning(
+                f"Could not find metadata for {obj.id} (CloudID: {obj.cloud.id}, Parent: {parent_id})"
+            )
+            return
 
         logger.info(f"Renaming {obj.id} to {target_name} with etag {meta['etag']}")
-        self.drive_svc.rename_item(obj.cloud.id, meta['etag'], target_name)
+        self.drive_svc.rename_item(obj.cloud.id, meta["etag"], target_name)
         logger.info(f"Renamed {obj.id} to {target_name} successfully.")
-        
+
         obj.local.name = target_name
         self.db.execute("UPDATE objects SET name=? WHERE id=?", (target_name, obj.id))
         logger.info(f"Updated DB name for {obj.id} to {target_name}.")
@@ -495,84 +739,107 @@ class SyncEngine:
         logger.info(f"Marked {obj.id} as synced after rename.")
 
     def _handle_move(self, obj, dest, metadata):
-        target_parent_row = self.db.fetchone("SELECT cloud_id FROM objects WHERE id=?", (dest,))
-        target_cloud_id = target_parent_row['cloud_id'] if target_parent_row else None
-        if dest == 'drive_root': target_cloud_id = CLOUD_DOCS_ZONE_ID_ROOT
-        
-        if not obj.cloud.id or not target_cloud_id: 
-            logger.warning(f"Missing Cloud IDs for move: Obj={obj.cloud.id}, Target={target_cloud_id}")
+        target_parent_row = self.db.fetchone(
+            "SELECT cloud_id FROM objects WHERE id=?", (dest,)
+        )
+        target_cloud_id = target_parent_row["cloud_id"] if target_parent_row else None
+        if dest == "drive_root":
+            target_cloud_id = CLOUD_DOCS_ZONE_ID_ROOT
+
+        if not obj.cloud.id or not target_cloud_id:
+            logger.warning(
+                f"Missing Cloud IDs for move: Obj={obj.cloud.id}, Target={target_cloud_id}"
+            )
             return
 
-        original_parent_id_local = metadata.get('original_parent_id')
+        original_parent_id_local = metadata.get("original_parent_id")
         original_parent_cloud_id = None
 
         if original_parent_id_local:
-             if original_parent_id_local == 'drive_root': 
-                 original_parent_cloud_id = CLOUD_DOCS_ZONE_ID_ROOT
-             else:
-                 orig_row = self.db.fetchone("SELECT cloud_id FROM objects WHERE id=?", (original_parent_id_local,))
-                 if orig_row: original_parent_cloud_id = orig_row['cloud_id']
-        
+            if original_parent_id_local == "drive_root":
+                original_parent_cloud_id = CLOUD_DOCS_ZONE_ID_ROOT
+            else:
+                orig_row = self.db.fetchone(
+                    "SELECT cloud_id FROM objects WHERE id=?",
+                    (original_parent_id_local,),
+                )
+                if orig_row:
+                    original_parent_cloud_id = orig_row["cloud_id"]
+
         # Fallback: if metadata didn't have original parent, or lookup failed, try obj.cloud_parent_id
         if not original_parent_cloud_id:
             original_parent_cloud_id = obj.cloud.parent_id
 
-        meta = self.drive_svc.get_item_metadata(obj.cloud.id, parent_id=original_parent_cloud_id)
+        meta = self.drive_svc.get_item_metadata(
+            obj.cloud.id, parent_id=original_parent_cloud_id
+        )
         if meta:
-            self.drive_svc.move_item(obj.cloud.id, meta['etag'], target_cloud_id)
-            self.db.execute("UPDATE objects SET parent_id=?, cloud_parent_id=? WHERE id=?", (dest, target_cloud_id, obj.id))
+            self.drive_svc.move_item(obj.cloud.id, meta["etag"], target_cloud_id)
+            self.db.execute(
+                "UPDATE objects SET parent_id=?, cloud_parent_id=? WHERE id=?",
+                (dest, target_cloud_id, obj.id),
+            )
             self.db.update_shadow(obj.id, parent_id=dest)
             self._mark_synced(obj)
         else:
-             logger.warning(f"Could not find metadata for move source {obj.id}")
+            logger.warning(f"Could not find metadata for move source {obj.id}")
 
     def _handle_delete(self, obj):
-        if not obj.cloud.id: return
+        if not obj.cloud.id:
+            return
         try:
-            self.drive_svc.delete_item(obj.cloud.id, obj.cloud.etag) 
+            self.drive_svc.delete_item(obj.cloud.id, obj.cloud.etag)
         except Exception:
-            pass 
+            pass
         self._cleanup_local(obj.id)
 
     def _handle_delete_by_id(self, obj_id):
         shadow = self.db.get_shadow(obj_id)
-        if shadow and shadow['cloud_id']:
+        if shadow and shadow["cloud_id"]:
             try:
-                self.drive_svc.delete_item(shadow['cloud_id'])
-            except: pass
+                self.drive_svc.delete_item(shadow["cloud_id"])
+            except:
+                pass
         self._cleanup_local(obj_id)
 
     def _handle_download(self, obj):
-        if not isinstance(obj, DriveFile) or not obj.cloud.id: return
+        if not isinstance(obj, DriveFile) or not obj.cloud.id:
+            return
         path = obj.get_local_full_path()
         self.drive_svc.download_file(obj.cloud.id, local_path=path)
-        
+
         import hashlib
+
         sha = hashlib.sha256()
-        with open(path, 'rb') as f:
-            while chunk := f.read(8192): sha.update(chunk)
-        
+        with open(path, "rb") as f:
+            while chunk := f.read(8192):
+                sha.update(chunk)
+
         obj.local.present = 1
         obj.local.size = os.path.getsize(path)
-        
+
         # Download doesn't change parent, but we can pass existing one to stay safe
-        self._update_db_and_shadow(obj, obj.cloud.id, obj.cloud.etag, obj.local.size, sha.hexdigest())
+        self._update_db_and_shadow(
+            obj, obj.cloud.id, obj.cloud.etag, obj.local.size, sha.hexdigest()
+        )
 
     def _handle_ensure_latest(self, obj):
-        if not obj.cloud.id: return
-        
+        if not obj.cloud.id:
+            return
+
         # Optimize: Check if parent folder was synced recently
         parent = OrchardObject.load(self.db, obj.local.parent_id)
         if parent:
             # If parent synced > 30s ago, refresh the folder
             if (int(time.time()) - parent.last_synced) > 30:
-                 if parent.cloud.id:
-                     self._pull_drive_folder(parent.cloud.id, parent.id)
-            
+                if parent.cloud.id:
+                    self._pull_drive_folder(parent.cloud.id, parent.id)
+
             # Reload object state from DB after potential pull
             updated_obj = OrchardObject.load(self.db, obj.id)
-            if not updated_obj: return 
-            
+            if not updated_obj:
+                return
+
             # Check if we need download
             # If _pull_drive_folder saw a change, it updated ETag and set present_locally=0
             # Also download if Partial (2) to Ensure Latest/Full
@@ -585,29 +852,53 @@ class SyncEngine:
     # HELPERS
     # ----------------------------------------------------------------
 
-    def _update_db_and_shadow(self, obj, cloud_id, etag, size, file_hash, cloud_parent_id=None):
+    def _update_db_and_shadow(
+        self, obj, cloud_id, etag, size, file_hash, cloud_parent_id=None
+    ):
         now = int(time.time())
-        
+
         # Construct update query dynamically based on whether cloud_parent_id is provided
         if cloud_parent_id:
-            self.db.execute("""
+            self.db.execute(
+                """
                 UPDATE objects 
                 SET cloud_id=?, etag=?, size=COALESCE(?, size), missing_from_cloud=0, dirty=0, sync_state=?, last_synced=?, cloud_parent_id=?
                 WHERE id=?
-            """, (cloud_id, etag, size, SYNC_STATE_SYNCHRONIZED, now, cloud_parent_id, obj.id))
+            """,
+                (
+                    cloud_id,
+                    etag,
+                    size,
+                    SYNC_STATE_SYNCHRONIZED,
+                    now,
+                    cloud_parent_id,
+                    obj.id,
+                ),
+            )
         else:
-            self.db.execute("""
+            self.db.execute(
+                """
                 UPDATE objects 
                 SET cloud_id=?, etag=?, size=COALESCE(?, size), missing_from_cloud=0, dirty=0, sync_state=?, last_synced=?
                 WHERE id=?
-            """, (cloud_id, etag, size, SYNC_STATE_SYNCHRONIZED, now, obj.id))
-        
+            """,
+                (cloud_id, etag, size, SYNC_STATE_SYNCHRONIZED, now, obj.id),
+            )
+
         self.db.update_shadow(
-            obj.id, cloud_id=cloud_id, etag=etag, file_hash=file_hash, modified_at=now, parent_id=obj.local.parent_id
+            obj.id,
+            cloud_id=cloud_id,
+            etag=etag,
+            file_hash=file_hash,
+            modified_at=now,
+            parent_id=obj.local.parent_id,
         )
-        
+
         if isinstance(obj, DriveFile):
-            self.db.execute("UPDATE drive_cache SET present_locally=1, size=? WHERE object_id=?", (size, obj.id))
+            self.db.execute(
+                "UPDATE drive_cache SET present_locally=1, size=? WHERE object_id=?",
+                (size, obj.id),
+            )
 
     def _cleanup_local(self, obj_id):
         self.db.execute("DELETE FROM objects WHERE id=?", (obj_id,))
@@ -616,8 +907,12 @@ class SyncEngine:
 
     def _mark_synced(self, obj):
         now = int(time.time())
-        self.db.execute("UPDATE objects SET dirty=0, sync_state=?, last_synced=? WHERE id=?", (SYNC_STATE_SYNCHRONIZED, now, obj.id))
+        self.db.execute(
+            "UPDATE objects SET dirty=0, sync_state=?, last_synced=? WHERE id=?",
+            (SYNC_STATE_SYNCHRONIZED, now, obj.id),
+        )
 
     def _pull_metadata(self):
         if self.drive_svc:
-            self.db.enqueue_action('drive_root', 'list_children', 'pull')
+            self.db.enqueue_action("drive_root", "list_children", "pull")
+

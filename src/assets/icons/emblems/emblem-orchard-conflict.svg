@@ -6,6 +6,6 @@
   <path d="M185 81 C185 81 210 60 220 40" stroke="#34C759" stroke-width="20" stroke-linecap="round"/>
   <circle cx="220" cy="40" r="10" fill="#34C759"/>
 
-  <!-- Middle: Blue (Sync) -->
-  <circle cx="128" cy="138" r="40" fill="#007AFF"/>
+  <!-- Middle: Orange (Conflict) -->
+  <circle cx="128" cy="138" r="40" fill="#FF9500"/>
 </svg>

@@ -56,10 +56,6 @@ class OrchardWizard(Gtk.Assistant):
         lbl.set_markup("<span size='xx-large' weight='bold'>Welcome to Orchard</span>")
         self.page_welcome.pack_start(lbl, True, True, 0)
         
-        lbl = Gtk.Label()
-        lbl.set_markup("<span size='xx-large' weight='bold'>Welcome to Orchard</span>")
-        self.page_welcome.pack_start(lbl, True, True, 0)
-        
         desc = Gtk.Label(label="iCloud for Linux.\nSync your files seamlessly.")
         desc.set_justify(Gtk.Justification.CENTER)
         self.page_welcome.pack_start(desc, True, True, 0)

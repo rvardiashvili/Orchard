@@ -1,12 +1,13 @@
+import hashlib
 import sqlite3
 import os
 import threading
 import logging
 import time
-import json 
+import json
 
-from src.config.sync_config import MAX_RETRIES 
-from src.config.sync_states import SYNC_STATE_ERROR 
+from src.config.sync_config import MAX_RETRIES
+from src.config.sync_states import SYNC_STATE_ERROR
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,9 @@ CREATE TABLE IF NOT EXISTS chunk_cache (
     PRIMARY KEY (object_id, chunk_index),
     FOREIGN KEY(object_id) REFERENCES objects(id) ON DELETE CASCADE
 );
+
 """
+
 
 class OrchardDB:
     _instance = None
@@ -107,44 +110,96 @@ class OrchardDB:
         db_dir = os.path.dirname(self.db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
-            
+
         # Retry logic for initial connection to handle filesystem race conditions
         for attempt in range(3):
             try:
                 with sqlite3.connect(self.db_path, timeout=10.0) as conn:
                     # Removed WAL mode for stability during fresh start
-                    # conn.execute("PRAGMA journal_mode=WAL;") 
+                    # conn.execute("PRAGMA journal_mode=WAL;")
                     conn.executescript(SCHEMA)
-                    conn.execute("INSERT OR IGNORE INTO objects (id, type, name, parent_id) VALUES ('root', 'folder', 'root', NULL)")
-                    conn.execute("INSERT OR IGNORE INTO objects (id, type, name, parent_id) VALUES ('drive_root', 'folder', 'Drive', 'root')")
+                    conn.execute(
+                        "INSERT OR IGNORE INTO objects (id, type, name, parent_id) VALUES ('root', 'folder', 'root', NULL)"
+                    )
+                    conn.execute(
+                        "INSERT OR IGNORE INTO objects (id, type, name, parent_id) VALUES ('drive_root', 'folder', 'Drive', 'root')"
+                    )
+                    conn.execute(
+                        "INSERT OR IGNORE INTO objects (id, type, name, parent_id) VALUES ('photos_root', 'folder', 'Photos', 'root')"
+                    )
+
+                    # MIGRATION: Add request_hash column if missing
+                    try:
+                        conn.execute("SELECT request_hash FROM response_cache LIMIT 1")
+                    except sqlite3.OperationalError:
+                        logger.info(
+                            "Migrating DB: Adding request_hash column to response_cache"
+                        )
+                        conn.execute(
+                            "ALTER TABLE response_cache ADD COLUMN request_hash TEXT"
+                        )
+
+                    # MIGRATION: Add is_binary column
+                    try:
+                        conn.execute("SELECT is_binary FROM response_cache LIMIT 1")
+                    except sqlite3.OperationalError:
+                        logger.info(
+                            "Migrating DB: Adding is_binary column to response_cache"
+                        )
+                        conn.execute(
+                            "ALTER TABLE response_cache ADD COLUMN is_binary INTEGER DEFAULT 0"
+                        )
+
+                    # MIGRATION: Add json_record column to notes_content
+                    try:
+                        conn.execute("SELECT json_record FROM notes_content LIMIT 1")
+                    except sqlite3.OperationalError:
+                        logger.info(
+                            "Migrating DB: Adding json_record column to notes_content"
+                        )
+                        conn.execute(
+                            "ALTER TABLE notes_content ADD COLUMN json_record TEXT"
+                        )
+
                     conn.commit()
                 break
             except sqlite3.OperationalError as e:
+                # Handle DB locks
                 if "disk I/O error" in str(e) or "database is locked" in str(e):
                     if attempt < 2:
                         time.sleep(0.5)
                         continue
                 raise e
 
+    # ...
+
     def add_chunk(self, object_id, chunk_index):
         """Marks a specific chunk as present locally."""
-        self.execute("""
+        self.execute(
+            """
             INSERT OR REPLACE INTO chunk_cache (object_id, chunk_index, last_accessed)
             VALUES (?, ?, ?)
-        """, (object_id, chunk_index, int(time.time())))
+        """,
+            (object_id, chunk_index, int(time.time())),
+        )
 
     def has_chunk(self, object_id, chunk_index):
         """Checks if a specific chunk is present."""
-        row = self.fetchone("SELECT 1 FROM chunk_cache WHERE object_id=? AND chunk_index=?", (object_id, chunk_index))
+        row = self.fetchone(
+            "SELECT 1 FROM chunk_cache WHERE object_id=? AND chunk_index=?",
+            (object_id, chunk_index),
+        )
         return bool(row)
-    
+
     def get_present_chunks(self, object_id):
         """Returns a set of all present chunk indices for an object."""
-        rows = self.fetchall("SELECT chunk_index FROM chunk_cache WHERE object_id=?", (object_id,))
-        return {r['chunk_index'] for r in rows}
+        rows = self.fetchall(
+            "SELECT chunk_index FROM chunk_cache WHERE object_id=?", (object_id,)
+        )
+        return {r["chunk_index"] for r in rows}
 
     def get_conn(self):
-        if not hasattr(self.local_thread, 'conn'):
+        if not hasattr(self.local_thread, "conn"):
             # Connect with a reasonable timeout
             self.local_thread.conn = sqlite3.connect(self.db_path, timeout=60.0)
             self.local_thread.conn.row_factory = sqlite3.Row
@@ -197,27 +252,56 @@ class OrchardDB:
                 return cur.fetchall()
             raise
 
-    def update_shadow(self, obj_id, cloud_id=None, parent_id=None, name=None, etag=None, file_hash=None, modified_at=None):
+    def update_shadow(
+        self,
+        obj_id,
+        cloud_id=None,
+        parent_id=None,
+        name=None,
+        etag=None,
+        file_hash=None,
+        modified_at=None,
+    ):
         conn = self.get_conn()
-        exists = conn.execute("SELECT 1 FROM shadows WHERE object_id = ?", (obj_id,)).fetchone()
-        
+        exists = conn.execute(
+            "SELECT 1 FROM shadows WHERE object_id = ?", (obj_id,)
+        ).fetchone()
+
         if not exists:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO shadows (object_id, cloud_id, parent_id, name, etag, file_hash, modified_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (obj_id, cloud_id, parent_id, name, etag, file_hash, modified_at))
+            """,
+                (obj_id, cloud_id, parent_id, name, etag, file_hash, modified_at),
+            )
         else:
             fields, values = [], []
-            if cloud_id is not None: fields.append("cloud_id = ?"); values.append(cloud_id)
-            if parent_id is not None: fields.append("parent_id = ?"); values.append(parent_id)
-            if name is not None: fields.append("name = ?"); values.append(name)
-            if etag is not None: fields.append("etag = ?"); values.append(etag)
-            if file_hash is not None: fields.append("file_hash = ?"); values.append(file_hash)
-            if modified_at is not None: fields.append("modified_at = ?"); values.append(modified_at)
-            
+            if cloud_id is not None:
+                fields.append("cloud_id = ?")
+                values.append(cloud_id)
+            if parent_id is not None:
+                fields.append("parent_id = ?")
+                values.append(parent_id)
+            if name is not None:
+                fields.append("name = ?")
+                values.append(name)
+            if etag is not None:
+                fields.append("etag = ?")
+                values.append(etag)
+            if file_hash is not None:
+                fields.append("file_hash = ?")
+                values.append(file_hash)
+            if modified_at is not None:
+                fields.append("modified_at = ?")
+                values.append(modified_at)
+
             if fields:
                 values.append(obj_id)
-                conn.execute(f"UPDATE shadows SET {', '.join(fields)} WHERE object_id = ?", tuple(values))
+                conn.execute(
+                    f"UPDATE shadows SET {', '.join(fields)} WHERE object_id = ?",
+                    tuple(values),
+                )
         conn.commit()
 
     def get_shadow(self, obj_id):
@@ -226,119 +310,160 @@ class OrchardDB:
     def delete_shadow(self, obj_id):
         self.execute("DELETE FROM shadows WHERE object_id = ?", (obj_id,))
 
-    def enqueue_action(self, target_id, action_type, direction, destination=None, metadata=None, priority=0):
+    def enqueue_action(
+        self,
+        target_id,
+        action_type,
+        direction,
+        destination=None,
+        metadata=None,
+        priority=0,
+    ):
         conn = self.get_conn()
         meta_dict = metadata if isinstance(metadata, dict) else {}
-        
+
         # 1. Fetch ALL pending, processing, OR FAILED actions for this object
         # Including 'failed' allows us to merge into a failed upload/update and retry it
-        pending_actions = conn.execute("""
+        pending_actions = conn.execute(
+            """
             SELECT action_id, action_type, metadata, destination, status
             FROM actions 
             WHERE target_id = ? AND status IN ('pending', 'processing', 'failed')
             ORDER BY created_at DESC
-        """, (target_id,)).fetchall()
+        """,
+            (target_id,),
+        ).fetchall()
 
         def update_and_exit(action_id, updates):
             # If we update a 'failed' action, we must reset it to 'pending' to retry
-            updates['status'] = 'pending'
-            updates['retry_count'] = 0
-            updates['last_error'] = None
-            
+            updates["status"] = "pending"
+            updates["retry_count"] = 0
+            updates["last_error"] = None
+
             set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
             vals = list(updates.values()) + [action_id]
-            conn.execute(f"UPDATE actions SET {set_clause} WHERE action_id = ?", tuple(vals))
+            conn.execute(
+                f"UPDATE actions SET {set_clause} WHERE action_id = ?", tuple(vals)
+            )
             conn.commit()
-            logger.info(f"Coalesced action {action_type} into {action_id} for {target_id}")
+            logger.info(
+                f"Coalesced action {action_type} into {action_id} for {target_id}"
+            )
 
         def delete_and_exit(action_ids):
-             placeholders = ",".join("?" * len(action_ids))
-             conn.execute(f"DELETE FROM actions WHERE action_id IN ({placeholders})", tuple(action_ids))
-             conn.commit()
-             logger.info(f"Deleted actions {action_ids} due to {action_type} for {target_id}")
+            placeholders = ",".join("?" * len(action_ids))
+            conn.execute(
+                f"DELETE FROM actions WHERE action_id IN ({placeholders})",
+                tuple(action_ids),
+            )
+            conn.commit()
+            logger.info(
+                f"Deleted actions {action_ids} due to {action_type} for {target_id}"
+            )
 
         # --- LOGIC START ---
 
         # SCENARIO: LIST CHILDREN (Deduplication)
         # If we already have a pending/processing list_children for this target, we don't need another one.
-        if action_type == 'list_children':
+        if action_type == "list_children":
             for row in pending_actions:
-                if row['action_type'] == 'list_children':
+                if row["action_type"] == "list_children":
                     logger.info(f"Skipping duplicate list_children for {target_id}")
-                    return 
+                    return
             # If no duplicate found, fall through to enqueue
 
-        if action_type == 'delete':
-            ids_to_delete = [row['action_id'] for row in pending_actions if row['status'] != 'processing']
+        if action_type == "delete":
+            ids_to_delete = [
+                row["action_id"]
+                for row in pending_actions
+                if row["status"] != "processing"
+            ]
             if ids_to_delete:
                 delete_and_exit(ids_to_delete)
 
-        if action_type == 'rename':
+        if action_type == "rename":
             for row in pending_actions:
-                if row['status'] == 'processing': break
+                if row["status"] == "processing":
+                    break
 
-                prev_id = row['action_id']
-                prev_type = row['action_type']
-                prev_meta = json.loads(row['metadata']) if row['metadata'] else {}
+                prev_id = row["action_id"]
+                prev_type = row["action_type"]
+                prev_meta = json.loads(row["metadata"]) if row["metadata"] else {}
 
-                if prev_type == 'rename':
-                    prev_meta['to_name'] = meta_dict.get('to_name')
-                    update_and_exit(prev_id, {
-                        'destination': destination,
-                        'metadata': json.dumps(prev_meta)
-                    })
-                    return 
+                if prev_type == "rename":
+                    prev_meta["to_name"] = meta_dict.get("to_name")
+                    update_and_exit(
+                        prev_id,
+                        {"destination": destination, "metadata": json.dumps(prev_meta)},
+                    )
+                    return
 
-                if prev_type in ('upload', 'update_content'):
+                if prev_type in ("upload", "update_content"):
                     prev_meta.update(meta_dict)
-                    prev_meta['name'] = meta_dict.get('to_name')
-                    update_and_exit(prev_id, {'metadata': json.dumps(prev_meta)})
+                    prev_meta["name"] = meta_dict.get("to_name")
+                    update_and_exit(prev_id, {"metadata": json.dumps(prev_meta)})
                     return
-                
-                if prev_type == 'move': continue
+
+                if prev_type == "move":
+                    continue
                 break
 
-        if action_type == 'move':
+        if action_type == "move":
             for row in pending_actions:
-                if row['status'] == 'processing': break
+                if row["status"] == "processing":
+                    break
 
-                prev_id = row['action_id']
-                prev_type = row['action_type']
-                
-                if prev_type == 'move':
-                    update_and_exit(prev_id, {'destination': destination})
+                prev_id = row["action_id"]
+                prev_type = row["action_type"]
+
+                if prev_type == "move":
+                    update_and_exit(prev_id, {"destination": destination})
                     return
 
-                if prev_type == 'rename': continue
+                if prev_type == "rename":
+                    continue
                 break
 
-        if action_type == 'update_content':
-             for row in pending_actions:
-                if row['status'] == 'processing': break
+        if action_type == "update_content":
+            for row in pending_actions:
+                if row["status"] == "processing":
+                    break
 
-                prev_id = row['action_id']
-                prev_type = row['action_type']
-                prev_meta = json.loads(row['metadata']) if row['metadata'] else {}
-                
-                if prev_type == 'update_content':
-                     prev_meta.update(meta_dict)
-                     update_and_exit(prev_id, {'metadata': json.dumps(prev_meta)})
-                     return
-                
-                if prev_type == 'upload':
-                     prev_meta.update(meta_dict)
-                     update_and_exit(prev_id, {'metadata': json.dumps(prev_meta)})
-                     return
+                prev_id = row["action_id"]
+                prev_type = row["action_type"]
+                prev_meta = json.loads(row["metadata"]) if row["metadata"] else {}
 
-                if prev_type in ('rename', 'move'): continue
+                if prev_type == "update_content":
+                    prev_meta.update(meta_dict)
+                    update_and_exit(prev_id, {"metadata": json.dumps(prev_meta)})
+                    return
+
+                if prev_type == "upload":
+                    prev_meta.update(meta_dict)
+                    update_and_exit(prev_id, {"metadata": json.dumps(prev_meta)})
+                    return
+
+                if prev_type in ("rename", "move"):
+                    continue
                 break
 
         # Standard Enqueue
         meta_json = json.dumps(meta_dict) if meta_dict else None
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO actions (target_id, action_type, direction, destination, metadata, priority, created_at, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-        """, (target_id, action_type, direction, destination, meta_json, priority, int(time.time())))
+        """,
+            (
+                target_id,
+                action_type,
+                direction,
+                destination,
+                meta_json,
+                priority,
+                int(time.time()),
+            ),
+        )
         conn.commit()
 
     def get_next_action(self):
@@ -349,27 +474,53 @@ class OrchardDB:
             ORDER BY priority DESC, created_at ASC 
             LIMIT 1
         """).fetchone()
-        
+
         if row:
-            self.execute("UPDATE actions SET status = 'processing' WHERE action_id = ?", (row['action_id'],))
+            self.execute(
+                "UPDATE actions SET status = 'processing' WHERE action_id = ?",
+                (row["action_id"],),
+            )
             return dict(row)
         return None
 
     def complete_action(self, action_id):
-        self.execute("DELETE FROM actions WHERE action_id = ?", (action_id,))
+        # Mark completed instead of delete (for history)
+        self.execute(
+            "UPDATE actions SET status = 'completed' WHERE action_id = ?", (action_id,)
+        )
+        self.prune_history()
+
+    def prune_history(self):
+        # Keep 5 minutes of history
+        limit = int(time.time()) - 300
+        self.execute(
+            "DELETE FROM actions WHERE status = 'completed' AND created_at < ?",
+            (limit,),
+        )
 
     def fail_action(self, action_id, target_obj_id, error_msg=None):
-        self.execute("""
+        self.execute(
+            """
             UPDATE actions 
             SET status = 'failed', last_error = ?, retry_count = retry_count + 1 
             WHERE action_id = ?
-        """, (str(error_msg), action_id))
+        """,
+            (str(error_msg), action_id),
+        )
 
-        row = self.fetchone("SELECT retry_count FROM actions WHERE action_id = ?", (action_id,))
-        if row and row['retry_count'] > MAX_RETRIES:
-            logger.error(f"Action {action_id} for {target_obj_id} exceeded max retries. Setting object sync_state to ERROR.")
-            self.execute("UPDATE objects SET sync_state = ? WHERE id = ?", (SYNC_STATE_ERROR, target_obj_id))
+        row = self.fetchone(
+            "SELECT retry_count FROM actions WHERE action_id = ?", (action_id,)
+        )
+        if row and row["retry_count"] > MAX_RETRIES:
+            logger.error(
+                f"Action {action_id} for {target_obj_id} exceeded max retries. Setting object sync_state to ERROR."
+            )
+            self.execute(
+                "UPDATE objects SET sync_state = ? WHERE id = ?",
+                (SYNC_STATE_ERROR, target_obj_id),
+            )
             self.execute("DELETE FROM actions WHERE action_id = ?", (action_id,))
+
 
 def get_db(path=None):
     if OrchardDB._instance is None and path:
@@ -377,3 +528,4 @@ def get_db(path=None):
             if OrchardDB._instance is None:
                 OrchardDB._instance = OrchardDB(path)
     return OrchardDB._instance
+

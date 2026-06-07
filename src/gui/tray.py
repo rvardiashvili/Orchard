@@ -30,10 +30,10 @@ class OrchardTray:
         # Resolve icon path
         base_path = Path(__file__).parent.parent.parent.resolve()
         self.icon_base = base_path / "src/assets/icons"
-        self.icon_path = str(self.icon_base / "orchard-logo.svg")
+        self.icon_path = str(self.icon_base / "orchard-logo-normal.svg")
         
         if not os.path.exists(self.icon_path):
-            self.icon_path = "orchard-logo" # Fallback to installed name
+            self.icon_path = "orchard-logo-normal" # Fallback to installed name
 
         self.indicator = AppIndicator3.Indicator.new(
             self.app_id,
@@ -87,7 +87,7 @@ class OrchardTray:
     def _update_status(self):
         # Poll DB or Engine for status
         
-        icon_name = "orchard-logo"
+        icon_name = "orchard-logo-normal"
         
         try:
             # Check Offline
@@ -101,15 +101,21 @@ class OrchardTray:
                 failed = self.engine.db.fetchone("SELECT COUNT(*) as c FROM actions WHERE status='failed'")
                 fail_count = failed['c'] if failed else 0
                 
+                conflicts = self.engine.db.fetchone("SELECT COUNT(*) as c FROM objects WHERE sync_state='conflict'")
+                conflict_count = conflicts['c'] if conflicts else 0
+                
                 if fail_count > 0:
                     self.status_item.set_label(f"Status: {fail_count} Errors")
                     icon_name = "orchard-logo-error"
+                elif conflict_count > 0:
+                    self.status_item.set_label(f"Status: {conflict_count} Conflicts")
+                    icon_name = "orchard-logo-conflict"
                 elif count > 0:
                     self.status_item.set_label(f"Status: Syncing ({count} items)...")
                     icon_name = "orchard-logo-sync"
                 else:
                     self.status_item.set_label("Status: Idle (Synced)")
-                    icon_name = "orchard-logo"
+                    icon_name = "orchard-logo-normal"
             
             # Resolve to path if possible
             if self.icon_base:

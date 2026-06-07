@@ -22,7 +22,24 @@ from src.sync.engine import SyncEngine
 from src.fs.orchardFS import mount_daemon
 from src.config.manager import ConfigManager
 
+import shutil
+import subprocess
+
 logger = logging.getLogger(__name__)
+
+def show_startup_notification():
+    """Show a desktop notification that Orchard has started."""
+    try:
+        if shutil.which("notify-send"):
+            subprocess.run([
+                "notify-send", 
+                "-i", "orchard-logo", # Use our installed icon name
+                "-t", "5000",         # Show for 5 seconds
+                "Orchard", 
+                "Orchard is running in the background. Access the Control Panel from the system tray."
+            ])
+    except Exception as e:
+        logger.warning(f"Failed to show startup notification: {e}")
 
 def check_connection(host="1.1.1.1", port=53, timeout=3):
     """Check for internet connectivity."""
@@ -40,6 +57,7 @@ def main():
     parser.add_argument("--mount-point", required=False, help="Mount point (Overrides config)")
     parser.add_argument("--db-path", default=os.path.expanduser("~/.local/share/orchard/orchard.db"))
     parser.add_argument("--cookie-dir", default=os.path.expanduser("~/.local/share/orchard/icloud_session"))
+    parser.add_argument("--headless", action="store_true", help="Run Orchard without background GUI/Tray")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -52,6 +70,9 @@ def main():
     if args.mount_point: config.set("mount_point", args.mount_point)
     
     if not config.apple_id or not config.mount_point:
+        if args.headless:
+            logger.error("Configuration missing. Cannot launch Setup Wizard in headless mode. Please run Orchard normally first to configure.")
+            sys.exit(1)
         logger.info("Configuration missing. Launching Setup Wizard...")
         try:
             from src.gui.wizard import run_wizard
@@ -95,25 +116,42 @@ def main():
     fuse_thread.daemon = True
     fuse_thread.start()
 
+    # Notification
+    if not args.headless:
+        show_startup_notification()
+
     # 5. GUI / Main Loop
-    print("DEBUG: Starting GUI...")
-    try:
-        from src.gui.tray import OrchardTray
-        logger.info("Starting System Tray Icon...")
-        tray = OrchardTray(engine, mount_point)
-        # Enable Ctrl+C support for Gtk
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        tray.run()
-    except (ImportError, ValueError) as e:
-        logger.warning(f"GUI Unavailable ({e}). Running in Headless Mode.")
+    if not args.headless:
+        print("DEBUG: Starting GUI...")
+        try:
+            from src.gui.tray import OrchardTray
+            logger.info("Starting System Tray Icon...")
+            tray = OrchardTray(engine, mount_point)
+            # Enable Ctrl+C support for Gtk
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            tray.run()
+        except (ImportError, ValueError) as e:
+            logger.warning(f"GUI Unavailable ({e}). Running in Headless Mode.")
+            try:
+                while True: time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+        finally:
+            logger.info("Stopping...")
+            engine.stop()
+            # Ensure fusermount -u -z is executed as a shell command
+            os.system(f"fusermount -u -z {mount_point}")
+    else:
+        print("DEBUG: Running in Headless Mode...")
+        logger.info("Running in Headless Mode... (Press Ctrl+C to exit)")
         try:
             while True: time.sleep(1)
         except KeyboardInterrupt:
             pass
-    finally:
-        logger.info("Stopping...")
-        engine.stop()
-        os.system(f"fusermount -u -z {mount_point}")
+        finally:
+            logger.info("Stopping...")
+            engine.stop()
+            os.system(f"fusermount -u -z {mount_point}")
 
 def show_error_dialog(error_msg):
     """Try to show a native error dialog using system tools."""

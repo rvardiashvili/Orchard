@@ -115,10 +115,14 @@ class OrchardObject:
         row = db.fetchone("SELECT * FROM objects WHERE id = ?", (object_id,))
         if not row: return None
         
+        # Convert sqlite3.Row to dict to use .get()
+        row_dict = dict(row)
+        
         # Drive-Only Factory (Lazy import to avoid circular dependency)
         from src.objects.drive import DriveFile, DriveFolder
 
-        otype = row['type']
+        otype = row_dict['type']
+        
         if otype == 'file': 
             return DriveFile(db, row)
         if otype == 'folder': 

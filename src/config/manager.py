@@ -13,8 +13,9 @@ DEFAULT_CONFIG = {
     "mount_point": str(Path.home() / "iCloud"),
     "db_path": str(Path.home() / ".local/share/orchard/orchard.db"),
     "cookie_dir": str(Path.home() / ".local/share/orchard/icloud_session"),
-    "auto_start": False
+    "auto_start": False,
 }
+
 
 class ConfigManager:
     _instance = None
@@ -29,7 +30,7 @@ class ConfigManager:
         self._config = DEFAULT_CONFIG.copy()
         if CONFIG_FILE.exists():
             try:
-                with open(CONFIG_FILE, 'r') as f:
+                with open(CONFIG_FILE, "r") as f:
                     data = json.load(f)
                     self._config.update(data)
             except Exception as e:
@@ -38,7 +39,7 @@ class ConfigManager:
     def save(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            with open(CONFIG_FILE, 'w') as f:
+            with open(CONFIG_FILE, "w") as f:
                 json.dump(self._config, f, indent=4)
         except Exception as e:
             logger.error(f"Failed to save config: {e}")
@@ -51,13 +52,17 @@ class ConfigManager:
         self.save()
 
     @property
-    def apple_id(self): return self.get("apple_id")
-    
+    def apple_id(self):
+        return self.get("apple_id")
+
     @property
-    def mount_point(self): return self.get("mount_point")
-    
+    def mount_point(self):
+        return self.get("mount_point")
+
     @property
-    def db_path(self): return self.get("db_path")
-    
+    def db_path(self):
+        return self.get("db_path")
+
     @property
-    def cookie_dir(self): return self.get("cookie_dir")
+    def cookie_dir(self):
+        return self.get("cookie_dir")

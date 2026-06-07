@@ -17,11 +17,14 @@
     - Context Menus ("Make Available Offline", "Free Up Space") for Nautilus, Nemo, Dolphin, Thunar.
     - Custom Emblems (Local, Cloud, Partial, Modified) for visual status.
     - Nautilus Status Column.
+- [x] **Selective Sync**: Allow users to pin/unpin specific folders (Folder-level pinning) via context menus.
 - [x] **System & UI**:
     - System Tray Icon with status indicators (Online/Offline/Syncing).
     - Control Panel Application (GTK3) for status overview and manual conflict resolution.
     - Setup Wizard for easy first-time configuration.
     - Autostart integration (.desktop file).
+    - Headless Mode & CLI wrapper (`orchard`).
+    - Cross-Distro Installer Support (`apt`, `dnf`, `pacman`, `zypper`, `apk`, `xbps`).
 - [x] **Performance**: Multi-threaded Sync Engine (IO threads + Metadata thread).
 - [x] **App Polishing**: Custom icons, About dialog, and refined UI.
 
@@ -31,34 +34,12 @@
 ## Future Roadmap
 
 ### Phase 1 (Core Ecosystem)
-- [ ] **Notes**: Bi-directional sync using virtual markdown files (`.orchard-note`).
-- [ ] **Reminders**: Structured task lists synced as virtual files.
-- [ ] **Contacts**: Read-only integration (vCard export/sync).
-- [ ] **Calendar**: Read-only integration (iCal events).
+- [ ] **Contacts**: 2-way integration (vCard import/export/sync).
+- [ ] **Calendar**: 2-way integration (iCal events creation and sync).
 
 ### Phase 2 (Extended Media)
 - [ ] **Photos**: Metadata-only sync initially, with on-demand download.
 - [ ] **Mail**: (Feasibility study required).
 
 ### Phase 3 (Advanced)
-- [ ] **Selective Sync**: Allow users to pin/unpin specific folders (Folder-level pinning).
-- [ ] **Cross-Device Features**: Clipboard sync, AirDrop-style transfer (investigation needed).
-- [ ] **Partial Sync**: Support range requests for large files (currently downloads full file).
-
-## Future Roadmap
-
-### Phase 1 (Core Ecosystem)
-- [ ] **Notes**: Bi-directional sync using virtual markdown files (`.orchard-note`).
-- [ ] **Reminders**: Structured task lists synced as virtual files.
-- [ ] **Contacts**: Read-only integration (vCard export/sync).
-- [ ] **Calendar**: Read-only integration (iCal events).
-
-### Phase 2 (Extended Media)
-- [ ] **Photos**: Metadata-only sync initially, with on-demand download.
-- [ ] **Mail**: (Feasibility study required).
-
-### Phase 3 (System & UI)
-- [ ] **GUI Tray Icon**: Status indicator and simple controls.
-- [ ] **Selective Sync**: Allow users to pin/unpin specific folders.
-- [ ] **Shared Folders**: Support for iCloud shared directories.
 - [ ] **Cross-Device Features**: Clipboard sync, AirDrop-style transfer (investigation needed).

@@ -17,6 +17,7 @@ Orchard is a robust FUSE-based synchronization engine that creates a seamless br
 ## ✨ Key Features
 
 -   **System Tray & Control Panel**: Monitor sync status, view errors, and resolve file conflicts via a modern GUI dashboard.
+-   **Headless Mode & CLI**: Integrated `orchard` CLI wrapper to run the sync engine without any background GUI, ideal for servers or minimal setups.
 -   **Partial Sync & Streaming**: Open large files (movies, archives) instantly. Orchard downloads only the required 8MB chunks on-demand.
 -   **Desktop Integration**: 
     -   **Context Menus**: "Make Available Offline" and "Free Up Space" in Nautilus, Nemo, Dolphin, and Thunar.
@@ -44,8 +45,11 @@ cd orchard
 ./install.sh
 
 # 3. Start Orchard
-# Launch "Orchard" from your applications menu, or run:
-./src/main.py
+# Launch "Orchard" from your applications menu, or type the new CLI command:
+orchard
+
+# (Optional) Run without GUI/Tray:
+orchard --headless
 ```
 
 ### Manual Setup

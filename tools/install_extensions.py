@@ -140,39 +140,52 @@ def install_icons():
             try: base.mkdir() 
             except: pass
 
-    src_icons = Path(__file__).parent.parent / "src/assets/icons"
-    if not src_icons.exists():
-        print("Icon source not found.")
+    src_icons_root = Path(__file__).parent.parent / "src/assets/icons"
+    if not src_icons_root.exists():
+        print("Icon source root not found.")
         return
 
     for base in base_dirs:
         if not base.exists(): continue
         
-        # We try to install into scalable/emblems and scalable/apps
-        # If those don't exist in target (e.g. .icons), we create them or fallback to root?
-        # Standard: base/scalable/emblems
-        
-        emblem_dir = base / "scalable/emblems"
-        app_dir = base / "scalable/apps"
-        
-        # Fallback for simple .icons folder
-        if base.name == ".icons":
-            emblem_dir = base
-            app_dir = base
-        else:
-            emblem_dir.mkdir(parents=True, exist_ok=True)
-            app_dir.mkdir(parents=True, exist_ok=True)
-
         print(f"Installing to {base}...")
         
-        for icon in src_icons.glob("*.svg"):
-            if "orchard-logo" in icon.name:
-                shutil.copy(icon, app_dir / icon.name)
-                print(f"Installed App Icon: {icon.name}")
-            else:
-                shutil.copy(icon, emblem_dir / icon.name)
-                print(f"Installed Emblem: {icon.name}")
+        target_emblem_dir = base / "scalable/emblems"
+        target_app_dir = base / "scalable/apps"
         
+        # Handle simple .icons folder vs hicolor structure
+        if base.name == ".icons":
+            target_emblem_dir = base
+            target_app_dir = base
+        else:
+            target_emblem_dir.mkdir(parents=True, exist_ok=True)
+            target_app_dir.mkdir(parents=True, exist_ok=True)
+
+        for icon_path in src_icons_root.rglob("*.svg"): # Recursively find all SVGs
+            relative_path = icon_path.relative_to(src_icons_root)
+            # Determine destination based on top-level subdirectory
+            if len(relative_path.parts) > 1: # Has a subdirectory
+                top_level_dir = relative_path.parts[0]
+                
+                install_dir = None
+                icon_type = ""
+                if top_level_dir in ["app", "categories", "sidebar", "actions", "status"]:
+                    install_dir = target_app_dir
+                    icon_type = "App Icon"
+                elif top_level_dir == "emblems":
+                    install_dir = target_emblem_dir
+                    icon_type = "Emblem"
+                
+                if install_dir:
+                    shutil.copy(icon_path, install_dir / icon_path.name)
+                    print(f"Installed {icon_type}: {icon_path.name} to {install_dir}")
+                else:
+                    print(f"Warning: Could not determine install location for {icon_path.name}")
+            else: # Icons directly in src/assets/icons (should be empty after reorg)
+                print(f"Warning: Icon {icon_path.name} found directly in root assets/icons. Consider moving it.")
+                # Fallback to app_dir for any unclassified root icons
+                shutil.copy(icon_path, target_app_dir / icon_path.name)
+
         # Update cache
         if shutil.which("gtk-update-icon-cache") and base.name != ".icons":
             subprocess.run(["gtk-update-icon-cache", "-f", "-t", str(base)], stderr=subprocess.DEVNULL)

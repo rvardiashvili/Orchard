@@ -125,11 +125,11 @@ Orchard integrates deeply with Linux desktop environments via:
 *   **Tray Icon**: `src/gui/tray.py` runs a GTK3 AppIndicator loop in the main thread. It polls the Sync Engine for status.
 *   **Control Panel**: `src/gui/window.py` provides a dashboard for conflict resolution and settings.
 *   **Setup Wizard**: `src/gui/wizard.py` handles first-run configuration (Apple ID, Mount Point) and authentication.
-*   **Process Model**: Single process. `Main Thread` runs GUI. `Daemon Threads` run FUSE and Sync Engine.
+*   **Process Model**: Single process. `Main Thread` runs GUI. `Daemon Threads` run FUSE and Sync Engine. (Pass `--headless` to skip GUI initialization).
 
 ### Configuration & Deployment
 *   **Config Manager**: `src/config/manager.py` handles persistent settings in `~/.config/orchard/config.json`.
-*   **Installation**: `install.sh` automates dependency installation, virtual environment creation, and desktop shortcut generation (`~/.local/share/applications/orchard.desktop`).
+*   **Installation**: `install.sh` automates dependency installation across major distributions (`apt`, `dnf`, `pacman`, `zypper`, `apk`, `xbps`), virtual environment creation, desktop shortcut generation (`~/.local/share/applications/orchard.desktop`), and CLI wrapper creation (`~/.local/bin/orchard`).
 
 ### The "Lazy Open" Strategy
 To prevent file managers (Nautilus, Dolphin) from freezing the UI:
